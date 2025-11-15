@@ -1,0 +1,138 @@
+# =============================================================================
+# PRIVATE DATA — NEVER COMMIT (personal health data, auth tokens, API exports)
+# =============================================================================
+
+# Auth tokens & credentials
+*.har
+*.db
+*.sqlite
+token.json
+.env
+*.env
+credentials*
+
+# Personal data exports from Whoop Cloud API
+whoop_backup/
+whoop_official.json
+recovered_whoop_data.json
+whoop_api_endpoints.json
+QUICK_REFERENCE.txt
+DATA_RECOVERY_SUMMARY.md
+README_DATA_RECOVERY.md
+
+# BLE sync app data (backups, exports, dashboards with personal data)
+ble-sync/data/backup/
+ble-sync/data/whoop_backup/
+ble-sync/data/whoop_export/
+ble-sync/data/*.html
+ble-sync/data/*.db
+
+# Algorithm raw data (sensor databases, ground truth scores)
+algorithms/data/raw/
+algorithms/data/whoop_ground_truth/
+algorithms/*.html
+
+# =============================================================================
+# BUILD ARTIFACTS
+# =============================================================================
+
+# Android
+*.apk
+*.aab
+ble-sync/.gradle/
+ble-sync/app/build/
+ble-sync/build/
+ble-sync/local.properties
+
+# Flutter
+app/build/
+app/.dart_tool/
+app/.flutter-plugins
+app/.flutter-plugins-dependencies
+app/.metadata
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+*.egg-info/
+dist/
+
+# =============================================================================
+# IDE & OS
+# =============================================================================
+.idea/
+*.iml
+.vscode/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+.project
+.settings/
+.classpath
+
+# =============================================================================
+# CAPTURES & NETWORK TRACES (contain auth tokens)
+# =============================================================================
+captures/
+
+# =============================================================================
+# APK ANALYSIS (decompiled Whoop APK — not our code)
+# =============================================================================
+apk/
+
+# =============================================================================
+# FIRMWARE BINARIES (large, proprietary — download with firmware_downloader.py)
+# =============================================================================
+firmware/maverick_ambiq_*/
+firmware/puffin_*/
+firmware/archive/
+firmware/*.zip
+firmware/custom_firmware/*.o
+firmware/custom_firmware/*.elf
+firmware/custom_firmware/*.bin
+firmware/custom_firmware/*.zbin
+firmware/custom_firmware/*.dis
+firmware/custom_firmware/*.map
+
+# Generated analysis outputs (re-generate with track scripts)
+firmware/analysis/output/
+firmware/analysis/firmware_analysis_report.html
+
+# =============================================================================
+# INTERNAL NOTES (personal workflow, not for public)
+# =============================================================================
+MEMORY.md
+
+# =============================================================================
+# COPYRIGHTED MATERIAL
+# =============================================================================
+*.pdf
+
+# =============================================================================
+# TEMP & MISC
+# =============================================================================
+.playwright-mcp/
+*.png
+*.jpg
+*.jpeg
+.ruff_cache/
+*.lock
+uv.lock
+pubspec.lock
+
+# =============================================================================
+# OPTIMIZATION ARTIFACTS
+# =============================================================================
+algorithms/optimization_history.json
+algorithms/optimize_log.txt
+algorithms/algo5_best_params.json
+algorithms/*.joblib
+
+# =============================================================================
+# PRIVATE REFERENCE DATA (sanitized from public files, kept for internal use)
+# =============================================================================
+PRIVATE_DATA.md
