@@ -1,0 +1,7 @@
+backup/
+whoop_backup/
+whoop_export/
+*.html
+__pycache__/
+*.pyc
+.env
