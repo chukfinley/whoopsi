@@ -36,6 +36,10 @@ from algo4_calibrated.engine import (
 from algo5_ml.engine import MLScoringEngine
 from algo5_ml.features import extract_whoop_timeline as a5_extract_timeline
 from algo6_sleep_android.engine import SleepAndroidEngine
+from algo7_mihealth.engine import MiHealthEngine
+from algo8_yasa.engine import YasaEngine
+from algo9_neurokit.engine import NeuroKitEngine
+from algo10_sleepecg_full.engine import SleepECGFullEngine
 
 BERLIN = timedelta(hours=1)
 DEEP_DIVE_DIR = (
@@ -435,7 +439,10 @@ def get_sleep_window(df, day):
     return df[mask]
 
 
-def analyze_day(df, day, hrv_base, rhr_base, a5_engine=None, a6_engine=None):
+def analyze_day(
+    df, day, hrv_base, rhr_base, a5_engine=None, a6_engine=None, a7_engine=None,
+    a8_engine=None, a9_engine=None, a10_engine=None,
+):
     """Analyze one day with all algorithms."""
     day_df = df[df["date"] == day]
     sleep_df = get_sleep_window(df, day)
@@ -642,6 +649,137 @@ def analyze_day(df, day, hrv_base, rhr_base, a5_engine=None, a6_engine=None):
         except Exception as e:
             print(f"    algo6 failed: {e}")
 
+    # Algo 7: Mi Health (reverse-engineered Xiaomi phone sleep trace via HR proxy)
+    a7_algo = {
+        "name": "Mi Health (Xiaomi)",
+        "id": "algo7",
+        "recovery": 50,
+        "sleep_score": 0,
+        "strain": 0,
+        "sleep": {
+            "total_min": 0,
+            "sleep_min": 0,
+            "efficiency": 0,
+            "deep_pct": 0,
+            "light_pct": 0,
+            "rem_pct": 0,
+            "awake_pct": 0,
+            "deep_min": 0,
+            "light_min": 0,
+            "rem_min": 0,
+            "awake_min": 0,
+        },
+        "phases": [],
+    }
+    if a7_engine is not None and not sleep_df.empty:
+        try:
+            a7_phases, a7_sum = a7_engine.classify_sleep(sleep_df, rhr)
+            a7_algo = {
+                "name": "Mi Health (Xiaomi)",
+                "id": "algo7",
+                "recovery": 50,
+                "sleep_score": round(a7_sum["efficiency"]),
+                "strain": 0,
+                "sleep": a7_sum,
+                "phases": a7_phases,
+            }
+        except Exception as e:
+            print(f"    algo7 failed: {e}")
+
+    # Algo 8: YASA-inspired (HRV spectral analysis)
+    a8_algo = {
+        "name": "YASA Spectral",
+        "id": "algo8",
+        "recovery": 50,
+        "sleep_score": 0,
+        "strain": 0,
+        "sleep": {
+            "total_min": 0, "sleep_min": 0, "efficiency": 0,
+            "deep_pct": 0, "light_pct": 0, "rem_pct": 0, "awake_pct": 0,
+            "deep_min": 0, "light_min": 0, "rem_min": 0, "awake_min": 0,
+        },
+        "phases": [],
+    }
+    if a8_engine is not None and not sleep_df.empty:
+        try:
+            a8_phases, a8_sum = a8_engine.classify_sleep(sleep_df, rhr)
+            a8_rec = recovery_score(hrv, rhr, a8_sum["efficiency"], resp, hrv_base, rhr_base)
+            a8_algo = {
+                "name": "YASA Spectral",
+                "id": "algo8",
+                "recovery": a8_rec,
+                "sleep_score": round(a8_sum["efficiency"]),
+                "strain": strain_score(day_df["hr"]),
+                "sleep": a8_sum,
+                "phases": a8_phases,
+            }
+        except Exception as e:
+            print(f"    algo8 failed: {e}")
+
+    # Algo 9: NeuroKit2 (advanced HRV nonlinear features)
+    a9_algo = {
+        "name": "NeuroKit2 HRV",
+        "id": "algo9",
+        "recovery": 50,
+        "sleep_score": 0,
+        "strain": 0,
+        "sleep": {
+            "total_min": 0, "sleep_min": 0, "efficiency": 0,
+            "deep_pct": 0, "light_pct": 0, "rem_pct": 0, "awake_pct": 0,
+            "deep_min": 0, "light_min": 0, "rem_min": 0, "awake_min": 0,
+        },
+        "phases": [],
+    }
+    if a9_engine is not None and not sleep_df.empty:
+        try:
+            a9_phases, a9_sum = a9_engine.classify_sleep(sleep_df, rhr)
+            a9_rec = recovery_score(hrv, rhr, a9_sum["efficiency"], resp, hrv_base, rhr_base)
+            a9_algo = {
+                "name": "NeuroKit2 HRV",
+                "id": "algo9",
+                "recovery": a9_rec,
+                "sleep_score": round(a9_sum["efficiency"]),
+                "strain": strain_score(day_df["hr"]),
+                "sleep": a9_sum,
+                "phases": a9_phases,
+            }
+        except Exception as e:
+            print(f"    algo9 failed: {e}")
+
+    # Algo 10: Full SleepECG (ML + HR-based NREM splitting + cycle detection)
+    a10_algo = {
+        "name": "SleepECG Full",
+        "id": "algo10",
+        "recovery": 50,
+        "sleep_score": 0,
+        "strain": 0,
+        "sleep": {
+            "total_min": 0, "sleep_min": 0, "efficiency": 0,
+            "deep_pct": 0, "light_pct": 0, "rem_pct": 0, "awake_pct": 0,
+            "deep_min": 0, "light_min": 0, "rem_min": 0, "awake_min": 0,
+        },
+        "phases": [],
+    }
+    if a10_engine is not None and not sleep_df.empty:
+        try:
+            a10_phases, a10_sum = a10_engine.classify_sleep(sleep_df, rhr)
+            a10_rec = recovery_score(hrv, rhr, a10_sum["efficiency"], resp, hrv_base, rhr_base)
+            a10_algo = {
+                "name": "SleepECG Full",
+                "id": "algo10",
+                "recovery": a10_rec,
+                "sleep_score": round(a10_sum["efficiency"]),
+                "strain": strain_score(day_df["hr"]),
+                "sleep": a10_sum,
+                "phases": a10_phases,
+            }
+            # Add cycle info
+            if a10_sum.get("sleep_cycles"):
+                a10_algo["sleep_cycles"] = a10_sum["sleep_cycles"]
+                a10_algo["avg_cycle_min"] = a10_sum.get("avg_cycle_min", 0)
+        except Exception as e:
+            print(f"    algo10 failed: {e}")
+
     # HR timeseries (30s resolution for chart)
     ts_chart = []
     for i in range(0, len(day_df), 30):
@@ -701,6 +839,10 @@ def analyze_day(df, day, hrv_base, rhr_base, a5_engine=None, a6_engine=None):
             },
             a5_algo,
             a6_algo,
+            a7_algo,
+            a8_algo,
+            a9_algo,
+            a10_algo,
         ],
         "timeseries": ts_chart,
     }
@@ -719,8 +861,10 @@ def main():
 
     print("Loading ground truth...")
     gt_df = load_ground_truth()
+    if gt_df.empty:
+        gt_df = pd.DataFrame(columns=["date", "recovery_score", "sleep_score", "strain_score", "hrv_ms", "rhr_bpm", "resp_rate"])
     # Add sample day from Flutter app API cache
-    if "2025-01-15" not in gt_df["date"].values:
+    if "date" not in gt_df.columns or "2025-01-15" not in gt_df["date"].values:
         extra_gt = pd.DataFrame(
             [
                 {
@@ -744,7 +888,7 @@ def main():
         print(f"Loaded Whoop official data for: {list(whoop_official.keys())}")
 
     days = sorted(
-        d for d in df["date"].unique() if hasattr(d, "year") and d.year >= 2025
+        d for d in df["date"].unique() if hasattr(d, "year") and 2025 <= d.year <= 2026
     )
     print(f"\nDays available: {days}")
 
@@ -789,12 +933,41 @@ def main():
     a6_engine = SleepAndroidEngine()
     print("  algo6: ready (no training needed — rule-based actigraphy)")
 
+    # Initialize algo7 (Mi Health)
+    print("\nInitializing algo7 (Mi Health / Xiaomi reverse-engineered)...")
+    a7_engine = MiHealthEngine()
+    print("  algo7: ready (no training needed — rule-based phone sleep trace)")
+
+    # Initialize algo8 (YASA Spectral)
+    print("\nInitializing algo8 (YASA Spectral HRV analysis)...")
+    a8_engine = YasaEngine()
+    print("  algo8: ready (YASA-inspired spectral HRV sleep staging)")
+
+    # Initialize algo9 (NeuroKit2)
+    print("\nInitializing algo9 (NeuroKit2 advanced HRV)...")
+    a9_engine = NeuroKitEngine()
+    print("  algo9: ready (NeuroKit2 nonlinear HRV features)")
+
+    # Initialize algo10 (Full SleepECG)
+    print("\nInitializing algo10 (Full SleepECG pipeline)...")
+    a10_engine = SleepECGFullEngine()
+    print("  algo10: ready (SleepECG ML + HR-based NREM split + cycle detection)")
+
     # Analyze each day
     day_results = []
     for day in days:
         print(f"\nAnalyzing {day}...")
         result = analyze_day(
-            df, day, hrv_base, rhr_base, a5_engine=a5_engine, a6_engine=a6_engine
+            df,
+            day,
+            hrv_base,
+            rhr_base,
+            a5_engine=a5_engine,
+            a6_engine=a6_engine,
+            a7_engine=a7_engine,
+            a8_engine=a8_engine,
+            a9_engine=a9_engine,
+            a10_engine=a10_engine,
         )
         if result:
             # Add ground truth
@@ -817,19 +990,29 @@ def main():
             if wo:
                 if result["whoop"] is None:
                     result["whoop"] = {}
+
+                def _to_num(v):
+                    """Convert string values to float, return None for '--' or invalid."""
+                    if v is None or v == "--" or v == "":
+                        return None
+                    try:
+                        return float(str(v).replace("%", ""))
+                    except (ValueError, TypeError):
+                        return None
+
                 # Override with more detailed data if available
                 if wo.get("recovery") and wo["recovery"] != "--":
-                    result["whoop"]["recovery"] = wo["recovery"]
+                    result["whoop"]["recovery"] = _to_num(wo["recovery"])
                 if wo.get("sleep_score"):
-                    result["whoop"]["sleep"] = wo["sleep_score"]
+                    result["whoop"]["sleep"] = _to_num(wo["sleep_score"])
                 if wo.get("strain") and wo["strain"] != "--":
-                    result["whoop"]["strain"] = wo["strain"]
+                    result["whoop"]["strain"] = _to_num(wo["strain"])
                 if wo.get("hrv_ms") and wo["hrv_ms"] != "--":
-                    result["whoop"]["hrv_ms"] = wo["hrv_ms"]
+                    result["whoop"]["hrv_ms"] = _to_num(wo["hrv_ms"])
                 if wo.get("rhr_bpm") and wo["rhr_bpm"] != "--":
-                    result["whoop"]["rhr_bpm"] = wo["rhr_bpm"]
+                    result["whoop"]["rhr_bpm"] = _to_num(wo["rhr_bpm"])
                 if wo.get("resp_rate") and wo["resp_rate"] != "--":
-                    result["whoop"]["resp_rate"] = wo["resp_rate"]
+                    result["whoop"]["resp_rate"] = _to_num(wo["resp_rate"])
                 # Sleep stages
                 result["whoop"]["sleep_stages"] = {
                     "duration": wo.get("sleep_duration"),
@@ -858,6 +1041,13 @@ def main():
                 if whoop_phases:
                     result["whoop"]["phases"] = whoop_phases
             day_results.append(result)
+
+    # Filter out days with no useful data (no sleep phases from any algo)
+    day_results = [
+        dr for dr in day_results
+        if any(len(a.get("phases", [])) > 0 for a in dr["algos"])
+        or dr.get("whoop")
+    ]
 
     # Print comparison table
     print("\n" + "=" * 100)
@@ -940,8 +1130,7 @@ body{{background:var(--bg);color:var(--text);font-family:-apple-system,BlinkMacS
 .diff.pos{{color:var(--green)}}.diff.neg{{color:var(--red)}}.diff.neutral{{color:var(--dim)}}
 
 /* Sleep bars */
-.sleep-compare{{display:grid;grid-template-columns:1fr 1fr;gap:12px}}
-@media(max-width:500px){{.sleep-compare{{grid-template-columns:1fr}}}}
+.sleep-compare{{display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:12px}}
 .sleep-col .src{{font-size:10px;text-transform:uppercase;letter-spacing:1px;margin-bottom:8px;font-weight:600}}
 .sleep-bar{{display:flex;height:20px;border-radius:10px;overflow:hidden;margin-bottom:6px}}
 .sleep-bar .s{{transition:width .4s ease}}
@@ -1012,140 +1201,132 @@ function render(idx){{
   const d=D.days[idx];
   nav.innerHTML=D.days.map((dy,i)=>`<button class="day-btn ${{i===idx?'active':''}}" onclick="render(${{i}})">${{dy.date}}</button>`).join('');
 
-  // Find algo5 (ML GBoosting) — it has id "algo5"
+  // Find named algorithms
   const a5=d.algos.find(a=>a.id==='algo5')||d.algos[d.algos.length-1];
-  const others=d.algos.filter(a=>a!==a5);
+  const a6=d.algos.find(a=>a.id==='algo6');
+  const a8=d.algos.find(a=>a.id==='algo8');
+  const a9=d.algos.find(a=>a.id==='algo9');
+  const a10=d.algos.find(a=>a.id==='algo10');
+  // Primary algo = YASA Spectral
+  const primary=a8||a5;
+  const others=d.algos.filter(a=>a!==primary);
   const w=d.whoop||{{}};
   const wRec=parseFloat(w.recovery)||0;
-  const a5Rec=parseFloat(a5.recovery)||0;
+  const pRec=parseFloat(primary.recovery)||0;
   const ss=w.sleep_stages||{{}};
 
   let h='';
 
+  function sleepBarHtml(label,color,deep,light,rem,awake){{
+    const tp=(deep||0)+(light||0)+(rem||0)+(awake||0)||1;
+    return `<div class="sleep-col"><div class="src" style="color:${{color}}">${{label}}</div>
+      <div class="sleep-bar">
+        <div class="s" style="width:${{(deep||0)/tp*100}}%;background:var(--deep)"></div>
+        <div class="s" style="width:${{(light||0)/tp*100}}%;background:var(--light-s)"></div>
+        <div class="s" style="width:${{(rem||0)/tp*100}}%;background:var(--rem)"></div>
+        <div class="s" style="width:${{(awake||0)/tp*100}}%;background:var(--awake)"></div>
+      </div>
+      <div class="legend">
+        <span><span class="d" style="background:var(--deep)"></span>Deep<span class="dur">${{fmtMin(deep)}}</span></span>
+        <span><span class="d" style="background:var(--light-s)"></span>Light<span class="dur">${{fmtMin(light)}}</span></span>
+        <span><span class="d" style="background:var(--rem)"></span>REM<span class="dur">${{fmtMin(rem)}}</span></span>
+        <span><span class="d" style="background:var(--awake)"></span>Awake<span class="dur">${{fmtMin(awake)}}</span></span>
+      </div></div>`;
+  }}
+
   // === 1. Recovery Rings ===
-  h+=`<div class="card">
-    <h2>Recovery — ${{d.date}}</h2>
+  h+=`<details class="other-algos" open><summary>Recovery — ${{d.date}}</summary><div class="inner"><div class="card">
     <div class="ring-grid">
       <div class="ring-card" style="border-color:var(--green2)">
         <div class="label" style="color:var(--green)">Whoop Official</div>
         ${{ring(wRec,recCol(wRec))}}
       </div>
-      <div class="ring-card" style="border-color:var(--pink2)">
-        <div class="label" style="color:var(--pink)">ML GBoosting (Ours)</div>
-        ${{ring(a5Rec,recCol(a5Rec))}}
+      <div class="ring-card" style="border-color:#06b6d422">
+        <div class="label" style="color:#06b6d4">YASA Spectral (Ours)</div>
+        ${{ring(pRec,recCol(pRec))}}
       </div>
     </div>
-  </div>`;
+  </div></div></details>`;
 
   // === 2. Score Comparison Row ===
-  const a5hrv=a5.hrv||d.physio.hrv_rmssd;
-  const a5rhr=a5.rhr||d.physio.rhr;
-  h+=`<div class="card">
-    <h2>Scores — Whoop vs Ours</h2>
+  const phrv=primary.hrv||d.physio.hrv_rmssd;
+  const prhr=primary.rhr||d.physio.rhr;
+  h+=`<details class="other-algos" open><summary>Scores — Whoop vs YASA</summary><div class="inner"><div class="card">
     <div class="score-grid">
       <div class="score-cell">
         <div class="lbl">Recovery</div>
         <div class="w">${{wRec||'-'}}</div>
         <div class="vs">vs</div>
-        <div class="o">${{a5Rec||'-'}}</div>
-        ${{diffBadge(a5Rec,wRec)}}
+        <div class="o">${{pRec||'-'}}</div>
+        ${{diffBadge(pRec,wRec)}}
       </div>
       <div class="score-cell">
         <div class="lbl">Sleep</div>
         <div class="w">${{w.sleep||'-'}}</div>
         <div class="vs">vs</div>
-        <div class="o">${{a5.sleep_score||'-'}}</div>
-        ${{diffBadge(a5.sleep_score,w.sleep)}}
+        <div class="o">${{primary.sleep_score||'-'}}</div>
+        ${{diffBadge(primary.sleep_score,w.sleep)}}
       </div>
       <div class="score-cell">
         <div class="lbl">Strain</div>
         <div class="w">${{w.strain||'-'}}</div>
         <div class="vs">vs</div>
-        <div class="o">${{a5.strain||'-'}}</div>
-        ${{diffBadge(a5.strain,w.strain)}}
+        <div class="o">${{primary.strain||'-'}}</div>
+        ${{diffBadge(primary.strain,w.strain)}}
       </div>
       <div class="score-cell">
         <div class="lbl">HRV</div>
         <div class="w">${{w.hrv_ms||'-'}}<span style="font-size:11px;color:var(--dim)">ms</span></div>
         <div class="vs">vs</div>
-        <div class="o">${{a5hrv||'-'}}<span style="font-size:11px;color:var(--dim)">ms</span></div>
+        <div class="o">${{phrv||'-'}}<span style="font-size:11px;color:var(--dim)">ms</span></div>
       </div>
       <div class="score-cell">
         <div class="lbl">RHR</div>
         <div class="w">${{w.rhr_bpm||'-'}}<span style="font-size:11px;color:var(--dim)">bpm</span></div>
         <div class="vs">vs</div>
-        <div class="o">${{a5rhr||'-'}}<span style="font-size:11px;color:var(--dim)">bpm</span></div>
+        <div class="o">${{prhr||'-'}}<span style="font-size:11px;color:var(--dim)">bpm</span></div>
       </div>
     </div>
-  </div>`;
+  </div></div></details>`;
 
-  // === 3. Sleep Stages Bars — Whoop vs Ours ===
-  h+=`<div class="card"><h2>Sleep Stages</h2><div class="sleep-compare">`;
+  // === 3. Sleep Stages Bars — Whoop vs YASA (always open) ===
+  h+=`<details class="other-algos" open><summary>Sleep Stages — Whoop vs YASA</summary><div class="inner"><div class="card"><div class="sleep-compare">`;
 
   // Whoop side
-  h+=`<div class="sleep-col"><div class="src" style="color:var(--green)">Whoop Official</div>`;
   if(ss.deep_time){{
-    const wd=pT(ss.deep_time),wl=pT(ss.light_time),wr=pT(ss.rem_time),wa=pT(ss.awake_time);
-    const wt=wd+wl+wr+wa||1;
-    h+=`<div class="sleep-bar">
-      <div class="s" style="width:${{wd/wt*100}}%;background:var(--deep)"></div>
-      <div class="s" style="width:${{wl/wt*100}}%;background:var(--light-s)"></div>
-      <div class="s" style="width:${{wr/wt*100}}%;background:var(--rem)"></div>
-      <div class="s" style="width:${{wa/wt*100}}%;background:var(--awake)"></div>
-    </div>`;
-    h+=`<div class="legend">
-      <span><span class="d" style="background:var(--deep)"></span>Deep<span class="dur">${{ss.deep_time}}</span></span>
-      <span><span class="d" style="background:var(--light-s)"></span>Light<span class="dur">${{ss.light_time}}</span></span>
-      <span><span class="d" style="background:var(--rem)"></span>REM<span class="dur">${{ss.rem_time}}</span></span>
-      <span><span class="d" style="background:var(--awake)"></span>Awake<span class="dur">${{ss.awake_time}}</span></span>
-    </div>`;
+    h+=sleepBarHtml('Whoop Official','var(--green)',pT(ss.deep_time),pT(ss.light_time),pT(ss.rem_time),pT(ss.awake_time));
   }}else{{
-    h+=`<div style="color:var(--dim);font-size:11px;padding:8px 0">No sleep stage data</div>`;
+    h+=`<div class="sleep-col"><div class="src" style="color:var(--green)">Whoop Official</div><div style="color:var(--dim);font-size:11px;padding:8px 0">No sleep stage data</div></div>`;
   }}
-  h+=`</div>`;
 
-  // Ours side
-  const sl=a5.sleep;
-  const od=sl.deep_min||0,ol=sl.light_min||0,or2=sl.rem_min||0,oa=sl.awake_min||0;
-  const ot=od+ol+or2+oa||1;
-  h+=`<div class="sleep-col"><div class="src" style="color:var(--pink)">ML GBoosting (Ours)</div>`;
-  h+=`<div class="sleep-bar">
-    <div class="s" style="width:${{od/ot*100}}%;background:var(--deep)"></div>
-    <div class="s" style="width:${{ol/ot*100}}%;background:var(--light-s)"></div>
-    <div class="s" style="width:${{or2/ot*100}}%;background:var(--rem)"></div>
-    <div class="s" style="width:${{oa/ot*100}}%;background:var(--awake)"></div>
-  </div>`;
-  h+=`<div class="legend">
-    <span><span class="d" style="background:var(--deep)"></span>Deep<span class="dur">${{fmtMin(od)}}</span></span>
-    <span><span class="d" style="background:var(--light-s)"></span>Light<span class="dur">${{fmtMin(ol)}}</span></span>
-    <span><span class="d" style="background:var(--rem)"></span>REM<span class="dur">${{fmtMin(or2)}}</span></span>
-    <span><span class="d" style="background:var(--awake)"></span>Awake<span class="dur">${{fmtMin(oa)}}</span></span>
-  </div>`;
-  h+=`</div>`;
-  // Sleep as Android bar (algo6)
-  if(a6&&a6.sleep){{
-    const s6=a6.sleep;
-    const d6=s6.deep_min||0,l6=s6.light_min||0,r6=s6.rem_min||0,aw6=s6.awake_min||0;
-    const t6=d6+l6+r6+aw6||1;
-    h+=`<div class="sleep-col"><div class="src" style="color:#f59e0b">Sleep as Android (SAA)</div>`;
-    h+=`<div class="sleep-bar">
-      <div class="s" style="width:${{d6/t6*100}}%;background:var(--deep)"></div>
-      <div class="s" style="width:${{l6/t6*100}}%;background:var(--light-s)"></div>
-      <div class="s" style="width:${{r6/t6*100}}%;background:var(--rem)"></div>
-      <div class="s" style="width:${{aw6/t6*100}}%;background:var(--awake)"></div>
-    </div>`;
-    h+=`<div class="legend">
-      <span><span class="d" style="background:var(--deep)"></span>Deep<span class="dur">${{fmtMin(d6)}}</span></span>
-      <span><span class="d" style="background:var(--light-s)"></span>Light<span class="dur">${{fmtMin(l6)}}</span></span>
-      <span><span class="d" style="background:var(--rem)"></span>REM<span class="dur">${{fmtMin(r6)}}</span></span>
-      <span><span class="d" style="background:var(--awake)"></span>Awake<span class="dur">${{fmtMin(aw6)}}</span></span>
-    </div>`;
-    h+=`</div>`;
+  // YASA side
+  if(primary.sleep&&primary.sleep.total_min>0){{
+    const ps=primary.sleep;
+    h+=sleepBarHtml('YASA Spectral (Ours)','#06b6d4',ps.deep_min,ps.light_min,ps.rem_min,ps.awake_min);
   }}
-  h+=`</div></div>`;
 
-  // === 4. Sleep Phase Timeline — Whoop vs Ours ===
-  h+=`<div class="card"><h2>Sleep Timeline</h2>`;
+  h+=`</div></div></div></details>`;
+
+  // === 3b. Other Algo Sleep Bars (collapsed) ===
+  h+=`<details class="other-algos"><summary>Sleep Stages — Other Algorithms</summary><div class="inner"><div class="card"><div class="sleep-compare">`;
+  const barAlgos=[
+    [a9,'NeuroKit2 HRV','#8b5cf6'],
+    [a10,'SleepECG Full','#14b8a6'],
+    [a6,'Sleep as Android','#f59e0b'],
+    [d.algos.find(a=>a.id==='algo4'),'Whoop-Calibrated','#2ecc71'],
+  ];
+  barAlgos.forEach(([algo,name,color])=>{{
+    if(algo&&algo.sleep&&algo.sleep.total_min>0){{
+      const s=algo.sleep;
+      let lbl=name;
+      if(algo.sleep_cycles)lbl+=` (${{algo.sleep_cycles}} cycles)`;
+      h+=sleepBarHtml(lbl,color,s.deep_min,s.light_min,s.rem_min,s.awake_min);
+    }}
+  }});
+  h+=`</div></div></div></details>`;
+
+  // === 4. Sleep Phase Timeline — Whoop vs YASA ===
+  h+=`<details class="other-algos" open><summary>Sleep Timeline — Whoop vs YASA</summary><div class="inner"><div class="card">`;
 
   function mergePhases(phases){{
     if(!phases||!phases.length) return [];
@@ -1159,9 +1340,7 @@ function render(idx){{
 
   const tlSources=[];
   if(w.phases&&w.phases.length>0)tlSources.push({{name:'Whoop Official',color:'var(--green)',phases:w.phases,winMin:2}});
-  if(a5.phases&&a5.phases.length>0)tlSources.push({{name:'ML GBoosting (Ours)',color:'var(--pink)',phases:a5.phases,winMin:2}});
-  const a6=d.algos.find(a=>a.id==='algo6');
-  if(a6&&a6.phases&&a6.phases.length>0)tlSources.push({{name:'Sleep as Android',color:'#f59e0b',phases:a6.phases,winMin:2}});
+  if(a8&&a8.phases&&a8.phases.length>0)tlSources.push({{name:'YASA Spectral (Ours)',color:'#06b6d4',phases:a8.phases,winMin:1}});
 
   let allTimes=[];
   tlSources.forEach(s=>s.phases.forEach(p=>allTimes.push(p.time)));
@@ -1209,11 +1388,42 @@ function render(idx){{
     <span><span class="d" style="background:var(--rem)"></span>REM</span>
     <span><span class="d" style="background:var(--light-s)"></span>Light</span>
     <span><span class="d" style="background:var(--deep)"></span>Deep</span>
-  </div></div>`;
+  </div></div></div></details>`;
 
-  // === 5. Other Algorithms (collapsible) ===
+  // === 4b. Other Timelines (collapsed) ===
+  const otherTlSrc=[];
+  if(a9&&a9.phases&&a9.phases.length>0)otherTlSrc.push({{name:'NeuroKit2 HRV',color:'#8b5cf6',phases:a9.phases,winMin:1}});
+  if(a10&&a10.phases&&a10.phases.length>0)otherTlSrc.push({{name:'SleepECG Full',color:'#14b8a6',phases:a10.phases,winMin:1}});
+  if(a6&&a6.phases&&a6.phases.length>0)otherTlSrc.push({{name:'Sleep as Android',color:'#f59e0b',phases:a6.phases,winMin:2}});
+  if(a5&&a5.phases&&a5.phases.length>0)otherTlSrc.push({{name:'ML GBoosting',color:'var(--pink)',phases:a5.phases,winMin:2}});
+  if(otherTlSrc.length>0){{
+    h+=`<details class="other-algos"><summary>Timelines — Other Algorithms (${{otherTlSrc.length}})</summary><div class="inner"><div class="card">`;
+    let otherTimes2=[];
+    otherTlSrc.forEach(s=>s.phases.forEach(p=>otherTimes2.push(p.time)));
+    if(otherTimes2.length>0){{
+      otherTimes2.sort();
+      const toM2=t=>{{const[hh,mm]=t.split(':').map(Number);return hh*60+mm;}};
+      let mn2=toM2(otherTimes2[0]),mx2=toM2(otherTimes2[otherTimes2.length-1]);
+      if(mx2<mn2)mx2+=24*60;
+      const sp2=mx2-mn2||1;
+      otherTlSrc.forEach(s=>{{
+        const wm=s.winMin||2;
+        const segs=mergePhases(s.phases);
+        h+=`<div class="tl-row"><div class="tl-label" style="color:${{s.color}}">${{s.name}}</div><div class="tl-track">`;
+        segs.forEach(seg=>{{
+          let sMin=toM2(seg.from);if(sMin<mn2)sMin+=24*60;
+          let eMin=toM2(seg.to);if(eMin<mn2)eMin+=24*60;eMin+=wm;
+          h+=`<div class="tl-seg" title="${{seg.phase}} ${{seg.from}}-${{seg.to}}" style="left:${{(sMin-mn2)/sp2*100}}%;width:${{Math.max((eMin-sMin)/sp2*100,0.5)}}%;background:${{pC[seg.phase]||'#333'}}"></div>`;
+        }});
+        h+=`</div></div>`;
+      }});
+    }}
+    h+=`</div></div></details>`;
+  }}
+
+  // === 5. All Algorithm Scores Table (collapsed) ===
   if(others.length>0){{
-    h+=`<details class="other-algos"><summary>Show other algorithms (${{others.length}})</summary><div class="inner">`;
+    h+=`<details class="other-algos"><summary>All Algorithm Scores (${{d.algos.length}} algorithms)</summary><div class="inner">`;
 
     // Score comparison table
     h+=`<div class="card"><h2>All Algorithm Scores</h2>`;
@@ -1228,14 +1438,15 @@ function render(idx){{
         <div style="color:#ba68c8">${{ss.rem_time||'-'}}</div>
       </div>`;
     }}
-    // algo5 row
-    h+=`<div class="compare-row"><div><span class="tag" style="background:var(--pink2);color:var(--pink)">ML GBoosting</span></div>
-      <div style="color:${{recCol(a5Rec)}};font-weight:700">${{a5Rec}}%</div>
-      <div style="font-weight:700">${{a5.sleep_score}}%</div><div style="font-weight:700">${{a5.strain}}</div>
-      <div>${{a5hrv}}ms / ${{a5rhr}}bpm</div>
-      <div style="color:#7986cb">${{fmtMin(sl.deep_min)}}</div>
-      <div style="color:#64b5f6">${{fmtMin(sl.light_min)}}</div>
-      <div style="color:#ba68c8">${{fmtMin(sl.rem_min)}}</div>
+    // YASA row
+    const psl=primary.sleep||{{}};
+    h+=`<div class="compare-row"><div><span class="tag" style="background:#06b6d422;color:#06b6d4">YASA Spectral</span></div>
+      <div style="color:${{recCol(pRec)}};font-weight:700">${{pRec}}%</div>
+      <div style="font-weight:700">${{primary.sleep_score}}%</div><div style="font-weight:700">${{primary.strain}}</div>
+      <div>${{phrv}}ms / ${{prhr}}bpm</div>
+      <div style="color:#7986cb">${{fmtMin(psl.deep_min)}}</div>
+      <div style="color:#64b5f6">${{fmtMin(psl.light_min)}}</div>
+      <div style="color:#ba68c8">${{fmtMin(psl.rem_min)}}</div>
     </div>`;
     // other algos
     others.forEach((a,i)=>{{
@@ -1315,7 +1526,14 @@ function render(idx){{
 
   content.innerHTML=h;
 }}
-render(D.days.length-2>=0?D.days.length-2:0);
+// Find best default day: last day with whoop data, or last day with phases
+let defIdx=D.days.length-1;
+for(let i=D.days.length-1;i>=0;i--){{
+  const dy=D.days[i];
+  if(dy.whoop&&dy.whoop.recovery){{defIdx=i;break;}}
+  if(dy.algos.some(a=>a.phases&&a.phases.length>5))defIdx=i;
+}}
+render(defIdx);
 </script></body></html>"""
 
 

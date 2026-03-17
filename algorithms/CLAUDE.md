@@ -1,10 +1,85 @@
 # Algorithms — Detailed Documentation
 
-**Status: ON HOLD (Feb 2026)** — See `agents.md` for sleep phase classifier state and next steps.
+**Status: ACTIVE (Mar 2026)** — ML model trained on Whoop labels, MAE 8.0 (best of 6 algorithms).
 
 ---
 
-## Quick Start
+## Quick Start — Trained ML Model
+
+```bash
+cd algorithms
+source .venv/bin/activate
+
+# Re-train model (needs sensor DB + Whoop deep dive labels)
+python3 train_whoop_model.py
+
+# Compare all 6 algorithms (generates algo_compare.html)
+python3 algo_compare.py
+
+# Serve dashboard
+python3 -m http.server 8080
+# → http://localhost:8080/algo_compare.html
+```
+
+### Adding More Training Data
+
+1. Sync raw sensor data from Whoop strap via BLE companion app
+2. Pull Whoop cloud labels: `whoop login --email you@email.com && whoop deep-dive --date all`
+3. Re-run `python3 train_whoop_model.py` — model improves with more nights
+
+### Key Files (New — Mar 2026)
+
+| File | Purpose |
+|------|---------|
+| `train_whoop_model.py` | Train ML model on Whoop labels (HistGBT, 41 features, LONO-CV) |
+| `whoop_model.joblib` | Trained sleep staging model (4-class: awake/light/deep/rem) |
+| `whoop_score_models.joblib` | Recovery + Sleep Score regressors |
+| `algo_compare.py` | Compare 6 algorithms, generate algo_compare.html |
+| `dashboard_yasa.py` | Whoop vs YASA focused dashboard (older) |
+| `algo8_yasa/engine.py` | YASA-inspired HRV spectral sleep staging |
+| `algo9_neurokit/engine.py` | NeuroKit2 nonlinear HRV features |
+| `algo10_sleepecg_full/engine.py` | Full SleepECG + cycle detection |
+
+### Algorithm Comparison (16 nights, Mar 2026)
+
+| Algorithm | MAE vs Whoop | Nights Won |
+|-----------|-------------|------------|
+| **F: Trained ML** | **8.0** | **13/16** |
+| C: HRV Nonlinear | 13.5 | 2/16 |
+| B: SleepECG ML | 18.3 | 0/16 |
+| D: HR Delta | 20.9 | 1/16 |
+| A: HRV Spectral | 32.8 | 0/16 |
+| E: YASA | 32.8 | 0/16 |
+
+### Trained Model Features (41 total)
+
+Top 5 by importance:
+1. `roll10_rmssd_mean` (0.158) — 10-min rolling HRV average
+2. `hr_above_rhr` (0.117) — HR relative to resting
+3. `fraction_of_night` (0.110) — temporal position
+4. `roll5_rmssd_mean` (0.104) — 5-min rolling HRV
+5. `roll10_hr_mean` (0.078) — 10-min rolling HR
+
+Sensor features: HR, RR intervals (always available), accel/gyro/SpO2 (zeros currently, ready for when data available)
+
+### Data Requirements
+
+- **Sensor data**: `data/raw/whoop_capture.db` — per-second HR + RR from BLE sync
+- **Whoop labels**: `ble-sync/data/backup/api/deep_dive/` OR `ble-sync/data/whoop_backup/deep_dive/`
+- **Whoop official scores**: `data/raw/whoop_official.json` — for Recovery/Sleep Score training
+- **Overlapping nights needed**: Currently 15 (Jan 28 - Feb 13, 2026)
+- **More data = better model**: Target 50+ nights for production quality
+
+### Known Limitations
+
+1. **Awake recall is 24%** — without accelerometer, awake during sleep looks like light sleep in HR/HRV
+2. **Recovery/Sleep Score models overfit** — only 8 training nights, need 30+ for useful regression
+3. **SleepECG classifier corrupted** — `~/.sleepecg/classifiers/wrn-gru-mesa.zip` needs re-download
+4. **REM tends to be over-predicted** — model bias from limited training data
+
+---
+
+## Original Quick Start (algo1-7)
 
 ```bash
 cd algorithms
@@ -52,6 +127,19 @@ Reverse-engineered Whoop scoring formulas, auto-optimized via differential evolu
 
 ### algo5_ml — ML Sleep Phase Classifier (74.7% LONO)
 **Primary focus.** Full details in `agents.md`.
+
+### algo6_sleep_android — Sleep as Android (Reverse-Engineered)
+Reverse-engineered actigraphy pipeline from Sleep as Android (com.urbandroid.sleep).
+Uses HR-derived movement proxy fed through the full offline hypnogram pipeline:
+adaptive normalization → deep/light classification → REM detection → awake overlay.
+Source: `common/sleep_algorithm.py` (Part 1, ~1500 lines).
+
+### algo7_mihealth — Mi Health / Xiaomi Fitness (Reverse-Engineered)
+Reverse-engineered phone-based sleep trace from Mi Health (com.xiaomi.fitness).
+Uses HR-derived synthetic sleep logs fed through SleepAnalyzerBeta (5-min debounce)
+→ stage merge → trim → report. Classifies SLEEPING vs AWAKE (no deep/light/REM from
+phone sensors alone). Includes wake time prediction utility.
+Source: `common/sleep_algorithm.py` (Part 2, ~475 lines).
 
 HistGradientBoostingClassifier + Viterbi post-processing for per-2-minute sleep phase classification:
 - 84 features per 2-min window
@@ -202,8 +290,11 @@ pp_bounds = [
 | `algo5_ml/engine.py` | ~678 | MLScoringEngine: HistGBT + Viterbi + daily scores |
 | `algo5_ml/train.py` | ~197 | Training script with LONO-CV evaluation |
 | `algo4_calibrated/engine.py` | ~400 | Whoop-calibrated scoring (reverse-engineered) |
+| `common/sleep_algorithm.py` | ~2130 | Reverse-engineered sleep algorithms (Sleep as Android + Mi Health) |
 | `common/preprocessing.py` | ~300 | HRV, RHR, respiratory rate computation |
 | `common/metrics.py` | ~100 | BaseAlgorithm ABC, WhoopScores dataclass |
+| `algo6_sleep_android/engine.py` | ~420 | SAA wrapper: HR→movement proxy→offline hypnogram |
+| `algo7_mihealth/engine.py` | ~310 | Mi Health wrapper: HR→synthetic logs→phone sleep trace |
 | `data/db_loader.py` | ~150 | Loads sensor data from whoop_capture.db |
 | `data/loader.py` | ~200 | Loads HAR-based data + whoop_official.json GT |
 
