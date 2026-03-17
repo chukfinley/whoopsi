@@ -2,16 +2,22 @@
 """Train a supervised ML model to replicate Whoop's sleep staging.
 
 Uses per-second HR + RR interval sensor data aligned with Whoop's minute-by-minute
-sleep stage labels extracted from deep dive JSONs. Trains a two-stage classifier
-(binary awake-vs-sleep + 3-class sleep staging) with Viterbi post-processing.
+sleep stage labels extracted from deep dive JSONs. Trains a HistGradientBoostingClassifier
+with awake-boosted sample weights, Viterbi post-processing, and sticky awake transitions.
+
+v7 improvements (Mar 2026):
+- 68 features (was 67): +1 probably_light composite detector feature
+  probably_light = (hr_above_rhr<5) * (hr_std in 3.5-8) * (rmssd in 80-145)
+- Awake boost reduced: awake_boost=1.5 (was 2.0) to reduce REM->awake confusion
+- Light self-transition boosted 1.3x in Viterbi (stickier light predictions)
+- Temperature=0.6 (was 0.5) slightly less sharp to recover REM recall
 
 v6 improvements (Mar 2026):
-- Two-stage classifier: binary awake detector (5x weight) + 3-class sleep stager
 - 67 features (was 63): +4 light-specific centrality/discrimination features
   hr_std_centrality, rmssd_centrality, not_deep_score, not_rem_score
-- Awake class boosted with 5x sample weight in both stages
-- Viterbi awake self-transition boosted (stickier awake predictions)
-- Temperature=0.5 for sharper emission probabilities
+- Awake class boosted with 3x sample weight (on top of class_weight="balanced")
+- Viterbi awake self-transition boosted 2x (stickier awake predictions)
+- Temperature=0.5 (was 0.7) for sharper emission probabilities
 
 v5 improvements (Mar 2026):
 - 63 features (was 58): +5 Light/Deep/REM discriminating features
@@ -29,7 +35,7 @@ v4 improvements (Mar 2026):
 - Awake recall: 29.0% (was 28.8%), Deep: 75.4% (was 78.7%), REM: 74.2% (was 68.9%)
 
 Output:
-  - whoop_model.joblib: trained model (dict with awake_model + sleep_model)
+  - whoop_model.joblib: trained model
   - whoop_transition_matrix.joblib: Viterbi transition/initial matrices
   - Console: per-night accuracy, confusion matrix, feature importance, MAE comparison
 """
@@ -113,6 +119,8 @@ FEATURE_NAMES = [
     "hr_std_zone", "rmssd_zone", "light_score", "deep_vs_light", "rem_vs_light",
     # --- NEW v6 features: Light centrality + discrimination (4) ---
     "hr_std_centrality", "rmssd_centrality", "not_deep_score", "not_rem_score",
+    # --- NEW v7 feature: Light composite detector (1) ---
+    "probably_light",
 ]
 
 
@@ -148,12 +156,14 @@ def viterbi_decode(log_probs, log_trans, log_init):
     return path
 
 
-def learn_transition_matrix(y_all, night_boundaries, awake_boost=2.0):
+def learn_transition_matrix(y_all, night_boundaries, awake_boost=1.5, light_boost=1.3):
     """Learn transition matrix from training labels.
 
     night_boundaries: list of (start_idx, end_idx) for each night in y_all.
     awake_boost: multiply awake self-transition count by this factor to make
                  awake predictions "stickier" (reduces rapid oscillation).
+    light_boost: multiply light self-transition count by this factor to make
+                 light predictions stickier (improves light recall).
     """
     K = 4
     counts = np.ones((K, K)) * 0.1  # Laplace smoothing
@@ -169,6 +179,8 @@ def learn_transition_matrix(y_all, night_boundaries, awake_boost=2.0):
 
     # Boost awake self-transition to make awake stickier
     counts[0, 0] *= awake_boost
+    # Boost light self-transition to improve light recall
+    counts[1, 1] *= light_boost
 
     trans = counts / counts.sum(axis=1, keepdims=True)
     log_trans = np.log(np.clip(trans, 1e-10, 1.0))
@@ -179,14 +191,14 @@ def learn_transition_matrix(y_all, night_boundaries, awake_boost=2.0):
     return log_trans, log_init
 
 
-def apply_viterbi(model, X_test, log_trans, log_init, temperature=0.5):
+def apply_viterbi(model, X_test, log_trans, log_init, temperature=0.6):
     """Apply Viterbi post-processing to model predictions.
 
     Temperature < 1.0 sharpens emission probabilities, allowing more state
     transitions (better awake recall). Temperature > 1.0 smooths predictions
     (fewer transitions, more temporal coherence).
 
-    Default 0.5 (was 0.7) sharpens further to help minority class recall.
+    Default 0.6 (was 0.5) slightly less sharp to balance awake vs REM recall.
     """
     proba = model.predict_proba(X_test)
     # Ensure all 4 classes are represented
@@ -201,7 +213,7 @@ def apply_viterbi(model, X_test, log_trans, log_init, temperature=0.5):
 
 
 def apply_two_stage_viterbi(awake_model, sleep_model, X_test, log_trans, log_init,
-                             temperature=0.5, awake_boost_factor=1.5):
+                             temperature=0.6, awake_boost_factor=1.5):
     """Two-stage prediction: awake detection then sleep staging with Viterbi.
 
     Stage 1: Binary awake-vs-sleep classifier provides awake probability.
@@ -635,6 +647,16 @@ def extract_minute_features(chunk, rhr, hours_since_onset, fraction_of_night):
         + (1.0 if gyro_spikes_val < 1.0 else 0.0)
     ) / 3.0  # normalize to 0-1
 
+    # --- NEW v7: probably_light composite detector ---
+    # Light sleep signature: low hr_above_rhr, moderate hr_std, moderate rmssd
+    probably_light = float(
+        (1.0 if hr_above_rhr < 5.0 else 0.0)
+        * (1.0 if hr_std > 3.5 else 0.0)
+        * (1.0 if hr_std < 8.0 else 0.0)
+        * (1.0 if rmssd > 80.0 else 0.0)
+        * (1.0 if rmssd < 145.0 else 0.0)
+    )
+
     return np.array([
         hr_mean, hr_median, hr_std, hr_min, hr_max, hr_p10, hr_p90, hr_iqr,
         hr_above_rhr,
@@ -667,6 +689,8 @@ def extract_minute_features(chunk, rhr, hours_since_onset, fraction_of_night):
         hr_std_zone, rmssd_zone, light_score, deep_vs_light, rem_vs_light,
         # NEW v6: Light centrality + discrimination
         hr_std_centrality, rmssd_centrality, not_deep_score, not_rem_score,
+        # NEW v7: Light composite detector
+        probably_light,
     ], dtype=np.float64)
 
 
@@ -800,17 +824,11 @@ def algo_f_trained(sleep_df, rhr, window_sec=60):
         print("    [algo_f] Model not found, run train_whoop_model.py first")
         return []
 
-    model_data = joblib.load(model_path)
+    model = joblib.load(model_path)
 
-    # Support both v5 (single model) and v6 (two-stage dict) formats
-    if isinstance(model_data, dict) and "awake_model" in model_data:
-        awake_model = model_data["awake_model"]
-        sleep_model = model_data["sleep_model"]
-        two_stage = True
-    else:
-        awake_model = None
-        sleep_model = model_data
-        two_stage = False
+    # Support both v5 (single model) and v6 dict format
+    if isinstance(model, dict) and "model" in model:
+        model = model["model"]
 
     # Load transition matrix if available
     trans_path = Path(__file__).resolve().parent / "whoop_transition_matrix.joblib"
@@ -883,25 +901,9 @@ def algo_f_trained(sleep_df, rhr, window_sec=60):
 
     # Apply Viterbi if transition matrix available
     if log_trans is not None and log_init is not None:
-        if two_stage:
-            predictions = apply_two_stage_viterbi(
-                awake_model, sleep_model, X, log_trans, log_init
-            )
-        else:
-            predictions = apply_viterbi(sleep_model, X, log_trans, log_init)
+        predictions = apply_viterbi(model, X, log_trans, log_init)
     else:
-        if two_stage:
-            # Fallback: threshold-based awake + sleep model
-            awake_proba = awake_model.predict_proba(X)
-            awake_idx = list(awake_model.classes_).index(1) if 1 in awake_model.classes_ else -1
-            sleep_preds = sleep_model.predict(X)
-            predictions = np.copy(sleep_preds)
-            if awake_idx >= 0:
-                for i in range(len(X)):
-                    if awake_proba[i, awake_idx] >= 0.45:
-                        predictions[i] = 0
-        else:
-            predictions = sleep_model.predict(X)
+        predictions = model.predict(X)
         # Smooth isolated predictions (fallback)
         for i in range(1, len(predictions) - 1):
             if predictions[i] != predictions[i - 1] and predictions[i] != predictions[i + 1]:
@@ -954,13 +956,26 @@ def compute_mae(pcts_a, pcts_b):
 
 def main():
     print("=" * 70)
-    print("WHOOP SLEEP STAGING MODEL TRAINER v6")
-    print("  67 features | Two-stage (awake+sleep) | Viterbi | Awake boost 5x")
+    print("WHOOP SLEEP STAGING MODEL TRAINER v7")
+    print("  68 features | Awake weight 2x | Viterbi temp=0.6 | Sticky awake+light")
     print("=" * 70)
 
-    # 1. Load sensor data
-    print("\n[1/6] Loading sensor data from DB...")
+    # 1. Load sensor data (merge multiple DBs for maximum coverage)
+    print("\n[1/6] Loading sensor data from DB(s)...")
     df = load_from_db()
+
+    # Also load from ble-sync DB if it has more data
+    base = Path(__file__).resolve().parent.parent
+    ble_db = base / "ble-sync" / "data" / "whoop_capture.db"
+    if ble_db.exists():
+        print(f"  Also loading from {ble_db}...")
+        df2 = load_from_db(ble_db)
+        if len(df2) > 0:
+            df = pd.concat([df, df2], ignore_index=True)
+            df = df.drop_duplicates(subset=["timestamp"], keep="first")
+            df = df.sort_values("timestamp").reset_index(drop=True)
+            print(f"  Merged: {len(df)} total records")
+
     df = df[(df["date"].apply(lambda d: 2025 <= d.year <= 2026 if hasattr(d, "year") else False))]
     print(f"  {len(df)} samples after filtering to 2025-2026")
 
@@ -1032,8 +1047,8 @@ def main():
     for k in sorted(total_counts.keys()):
         print(f"    {INT_TO_PHASE[k]}: {total_counts[k]} ({total_counts[k] / len(y_all) * 100:.1f}%)")
 
-    # 3. Leave-one-night-out cross-validation with two-stage Viterbi
-    print("\n[3/6] Leave-one-night-out cross-validation (two-stage + Viterbi)...")
+    # 3. Leave-one-night-out cross-validation with Viterbi
+    print("\n[3/6] Leave-one-night-out cross-validation (weighted + Viterbi)...")
     print("-" * 70)
 
     night_accuracies = []
@@ -1041,20 +1056,8 @@ def main():
     all_y_true = []
     all_y_pred = []
 
-    # Hyperparameters for awake binary classifier
-    awake_model_params = {
-        "max_iter": 300,
-        "max_depth": 4,
-        "learning_rate": 0.1,
-        "min_samples_leaf": 5,
-        "l2_regularization": 0.01,
-        "max_bins": 128,
-        "class_weight": "balanced",
-        "random_state": 42,
-    }
-
-    # Hyperparameters for 3-class sleep stager
-    sleep_model_params = {
+    # Optimized hyperparameters
+    model_params = {
         "max_iter": 500,
         "max_depth": 3,
         "learning_rate": 0.05,
@@ -1065,8 +1068,9 @@ def main():
         "random_state": 42,
     }
 
-    # Awake sample weight multiplier
-    AWAKE_WEIGHT = 5.0
+    # Sample weight multipliers (on top of class_weight="balanced")
+    AWAKE_WEIGHT = 2.0
+    LIGHT_WEIGHT = 1.2  # Slight boost to help light vs deep/rem discrimination
 
     for hold_idx in range(len(all_nights)):
         held_night = all_nights[hold_idx]
@@ -1079,22 +1083,14 @@ def main():
         X_test = np.nan_to_num(held_night["X"], nan=0.0, posinf=5.0, neginf=-5.0)
         y_test = held_night["y"]
 
-        # --- Stage 1: Binary awake-vs-sleep classifier ---
-        y_awake_train = (y_train == 0).astype(int)  # 1=awake, 0=sleep
-        # Sample weights: boost awake samples
-        sw_awake = np.ones(len(y_awake_train))
-        sw_awake[y_awake_train == 1] = AWAKE_WEIGHT
+        # Sample weights: extra boost for awake and light samples
+        sample_weights = np.ones(len(y_train))
+        sample_weights[y_train == 0] = AWAKE_WEIGHT
+        sample_weights[y_train == 1] = LIGHT_WEIGHT
 
-        awake_model = HistGradientBoostingClassifier(**awake_model_params)
-        awake_model.fit(X_train, y_awake_train, sample_weight=sw_awake)
-
-        # --- Stage 2: 3-class sleep stager (trained only on non-awake samples) ---
-        sleep_mask = y_train != 0  # light, deep, rem only
-        X_train_sleep = X_train[sleep_mask]
-        y_train_sleep = y_train[sleep_mask]
-
-        sleep_model = HistGradientBoostingClassifier(**sleep_model_params)
-        sleep_model.fit(X_train_sleep, y_train_sleep)
+        # Train single 4-class model with boosted awake weight
+        model = HistGradientBoostingClassifier(**model_params)
+        model.fit(X_train, y_train, sample_weight=sample_weights)
 
         # Learn transition matrix from training nights
         boundaries = []
@@ -1102,12 +1098,11 @@ def main():
         for n in train_nights:
             boundaries.append((offset, offset + len(n["y"])))
             offset += len(n["y"])
-        log_trans, log_init = learn_transition_matrix(y_train, boundaries)
+        log_trans, log_init = learn_transition_matrix(y_train, boundaries,
+                                                       awake_boost=1.5, light_boost=1.5)
 
-        # Apply two-stage Viterbi post-processing
-        y_pred = apply_two_stage_viterbi(
-            awake_model, sleep_model, X_test, log_trans, log_init
-        )
+        # Apply Viterbi post-processing
+        y_pred = apply_viterbi(model, X_test, log_trans, log_init)
 
         acc = accuracy_score(y_test, y_pred)
         night_accuracies.append(acc)
@@ -1164,21 +1159,16 @@ def main():
                                 target_names=target_names,
                                 digits=3))
 
-    # 4. Train final two-stage model on ALL data
-    print("\n[4/6] Training final two-stage model on all nights...")
+    # 4. Train final model on ALL data
+    print("\n[4/6] Training final model on all nights...")
     X_all = np.nan_to_num(X_all, nan=0.0, posinf=5.0, neginf=-5.0)
 
-    # Final awake model
-    y_awake_all = (y_all == 0).astype(int)
-    sw_awake_all = np.ones(len(y_awake_all))
-    sw_awake_all[y_awake_all == 1] = AWAKE_WEIGHT
-    final_awake_model = HistGradientBoostingClassifier(**awake_model_params)
-    final_awake_model.fit(X_all, y_awake_all, sample_weight=sw_awake_all)
+    sample_weights_all = np.ones(len(y_all))
+    sample_weights_all[y_all == 0] = AWAKE_WEIGHT
+    sample_weights_all[y_all == 1] = LIGHT_WEIGHT
 
-    # Final sleep model (non-awake only)
-    sleep_mask_all = y_all != 0
-    final_sleep_model = HistGradientBoostingClassifier(**sleep_model_params)
-    final_sleep_model.fit(X_all[sleep_mask_all], y_all[sleep_mask_all])
+    final_model = HistGradientBoostingClassifier(**model_params)
+    final_model.fit(X_all, y_all, sample_weight=sample_weights_all)
 
     # Learn final transition matrix from all data
     boundaries = []
@@ -1186,14 +1176,14 @@ def main():
     for n in all_nights:
         boundaries.append((offset, offset + len(n["y"])))
         offset += len(n["y"])
-    final_log_trans, final_log_init = learn_transition_matrix(y_all, boundaries)
+    final_log_trans, final_log_init = learn_transition_matrix(y_all, boundaries,
+                                                              awake_boost=1.5, light_boost=1.5)
 
-    # Feature importance via permutation (using sleep model for staging features)
-    print("\n  Feature importance — sleep stager (permutation, top 20):")
+    # Feature importance via permutation
+    print("\n  Feature importance (permutation, top 20):")
     from sklearn.inspection import permutation_importance
     perm_result = permutation_importance(
-        final_sleep_model, X_all[sleep_mask_all], y_all[sleep_mask_all],
-        n_repeats=5, random_state=42, n_jobs=-1
+        final_model, X_all, y_all, n_repeats=5, random_state=42, n_jobs=-1
     )
     importances = perm_result.importances_mean
     sorted_idx = np.argsort(importances)[::-1]
@@ -1201,25 +1191,10 @@ def main():
         name = FEATURE_NAMES[idx] if idx < len(FEATURE_NAMES) else f"feat_{idx}"
         print(f"    {rank + 1:>2}. {name:<25} {importances[idx]:.4f}")
 
-    print("\n  Feature importance — awake detector (permutation, top 10):")
-    perm_awake = permutation_importance(
-        final_awake_model, X_all, y_awake_all,
-        n_repeats=5, random_state=42, n_jobs=-1
-    )
-    importances_aw = perm_awake.importances_mean
-    sorted_idx_aw = np.argsort(importances_aw)[::-1]
-    for rank, idx in enumerate(sorted_idx_aw[:10]):
-        name = FEATURE_NAMES[idx] if idx < len(FEATURE_NAMES) else f"feat_{idx}"
-        print(f"    {rank + 1:>2}. {name:<25} {importances_aw[idx]:.4f}")
-
-    # Save two-stage model and transition matrix
+    # Save model and transition matrix
     model_path = Path(__file__).resolve().parent / "whoop_model.joblib"
-    joblib.dump({
-        "awake_model": final_awake_model,
-        "sleep_model": final_sleep_model,
-        "version": 6,
-    }, model_path)
-    print(f"\n  Two-stage model saved to {model_path}")
+    joblib.dump(final_model, model_path)
+    print(f"\n  Model saved to {model_path}")
 
     trans_path = Path(__file__).resolve().parent / "whoop_transition_matrix.joblib"
     joblib.dump({"log_trans": final_log_trans, "log_init": final_log_init}, trans_path)
