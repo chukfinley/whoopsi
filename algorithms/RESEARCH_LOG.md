@@ -62,6 +62,26 @@ The model tends to:
 - Under-predict awake (Viterbi makes this worse by smoothing away short awake bouts)
 - Over-predict deep on some nights, under-predict on others
 
+## Viterbi Temperature Experiment
+| Temperature | Accuracy | MAE | Awake | Light | Deep | REM |
+|---|---|---|---|---|---|---|
+| 0.5 | 70.6% | 5.7 | **40.3%** | 71.6% | 75.9% | 72.3% |
+| 0.6 | 70.8% | 5.9 | 37% | 72% | 75% | 73% |
+| **0.7** | **71.0%** | **5.9** | **36%** | 73% | 75% | 73% |
+| 0.8 | 70.9% | 6.0 | 33% | 73% | 75% | 73% |
+| 1.0 | 71.0% | 6.1 | 29% | 74% | 75% | 74% |
+| 1.5 | 70.7% | - | 21% | 75% | 75% | 74% |
+| 2.0 | 70.3% | - | 16% | 78% | 72% | 72% |
+
+Lower temperature = sharper emission probs = more state transitions = better awake recall.
+Selected temp=0.7 as sweet spot: same accuracy as temp=1.0 but +7pp awake recall.
+
+## v4 Final Results (committed)
+- **LONO Accuracy: 72.1%** (+1.7pp from v3 baseline 70.4%)
+- 58 features, max_depth=3, Viterbi (temp=0.7), sleep onset/offset detection
+- Awake: 30.9% (+2.1pp) | Light: 72.1% | Deep: 79.2% | REM: 77.3% (+8.4pp)
+- LONO MAE: 6.3
+
 ## Next Steps
 - [ ] Try gradient-boosted transition matrix (different weights for different times of night)
 - [ ] Augment awake class with synthetic examples
