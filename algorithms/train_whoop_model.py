@@ -69,6 +69,11 @@ FEATURE_NAMES = [
     "delta_hr", "delta_rmssd", "delta_lf_hf", "delta_rr_mean",
     # Accel/Gyro/SpO2 (optional — zeros if not available) (5)
     "accel_mag_mean", "accel_mag_std", "gyro_mean", "gyro_std", "spo2_mean",
+    # Awake-discriminating features (6)
+    "gyro_max", "gyro_spikes", "acc_jerk_max", "acc_jerk_p95",
+    "hr_range", "hr_spikes",
+    # SpO2 variability (REM indicator) (1)
+    "spo2_std",
 ]
 
 
@@ -340,6 +345,40 @@ def extract_minute_features(chunk, rhr, hours_since_onset, fraction_of_night):
         if len(spo2) > 0:
             spo2_mean_val = float(np.mean(spo2))
 
+    # --- Awake-discriminating features ---
+    # Gyro spikes and max (key awake indicator: 4x higher than light sleep)
+    gyro_max_val = 0.0
+    gyro_spikes_val = 0.0
+    if "gyro" in chunk.columns:
+        gyro_vals = chunk["gyro"].values
+        gyro_abs = np.abs(gyro_vals)
+        gyro_max_val = float(np.max(gyro_abs)) if len(gyro_abs) > 0 else 0.0
+        gyro_spikes_val = float(np.sum(gyro_abs > 0.05))  # count of significant rotations
+
+    # Accelerometer jerk (sudden movements)
+    acc_jerk_max_val = 0.0
+    acc_jerk_p95_val = 0.0
+    if "acc_x" in chunk.columns:
+        ax = chunk["acc_x"].values
+        ay = chunk["acc_y"].values
+        az = chunk["acc_z"].values
+        amag = np.sqrt(ax**2 + ay**2 + az**2)
+        if len(amag) > 1:
+            jerk = np.abs(np.diff(amag))
+            acc_jerk_max_val = float(np.max(jerk))
+            acc_jerk_p95_val = float(np.percentile(jerk, 95))
+
+    # HR range and spikes (awake has 1.6x higher range than light)
+    hr_range = float(np.max(hr_valid) - np.min(hr_valid))
+    hr_spikes_val = float(np.sum(np.abs(np.diff(hr_valid)) > 5)) if len(hr_valid) > 1 else 0.0
+
+    # SpO2 variability (higher in REM due to respiratory muscle relaxation)
+    spo2_std_val = 0.0
+    if "spo2" in chunk.columns:
+        spo2_vals = chunk["spo2"].dropna().values
+        if len(spo2_vals) > 1:
+            spo2_std_val = float(np.std(spo2_vals))
+
     return np.array([
         hr_mean, hr_median, hr_std, hr_min, hr_max, hr_p10, hr_p90, hr_iqr,
         hr_above_rhr,
@@ -354,6 +393,11 @@ def extract_minute_features(chunk, rhr, hours_since_onset, fraction_of_night):
         0.0, 0.0, 0.0, 0.0,  # delta_hr, delta_rmssd, delta_lf_hf, delta_rr_mean
         # Accel/Gyro/SpO2 (optional — zeros if data not available)
         accel_mag_mean, accel_mag_std, gyro_mean_val, gyro_std_val, spo2_mean_val,
+        # Awake-discriminating features
+        gyro_max_val, gyro_spikes_val, acc_jerk_max_val, acc_jerk_p95_val,
+        hr_range, hr_spikes_val,
+        # SpO2 variability
+        spo2_std_val,
     ], dtype=np.float64)
 
 
@@ -377,6 +421,14 @@ IDX_ACCEL_MAG_STD = 37
 IDX_GYRO_MEAN = 38
 IDX_GYRO_STD = 39
 IDX_SPO2_MEAN = 40
+# New awake features at 41-47
+IDX_GYRO_MAX = 41
+IDX_GYRO_SPIKES = 42
+IDX_ACC_JERK_MAX = 43
+IDX_ACC_JERK_P95 = 44
+IDX_HR_RANGE = 45
+IDX_HR_SPIKES = 46
+IDX_SPO2_STD = 47
 
 
 def add_rolling_and_delta(features_list):
