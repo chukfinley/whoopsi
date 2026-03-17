@@ -82,9 +82,29 @@ Selected temp=0.7 as sweet spot: same accuracy as temp=1.0 but +7pp awake recall
 - Awake: 30.9% (+2.1pp) | Light: 72.1% | Deep: 79.2% | REM: 77.3% (+8.4pp)
 - LONO MAE: 6.3
 
+## Ensemble and Two-Stage Experiments
+| Configuration | Accuracy | Awake | Light | Deep | REM | Notes |
+|---|---|---|---|---|---|---|
+| Two-stage (binary awake + 3-class) | 67.3% | **54%** | 67% | 75% | 63% | Great awake but hurts overall |
+| Ensemble d3+d4 | 71.2% | 30% | 76% | 74% | 71% | Marginal improvement |
+| Triple ensemble (d3+d4+d3lr0.1) | 71.1% | 31% | 76% | 73% | 70% | No benefit |
+
+**Conclusion**: Ensembles add complexity without meaningful gains. The two-stage
+approach shows that awake detection *can* work (54% recall) but at too high a cost
+to overall accuracy. The fundamental issue is that awake periods during sleep
+look nearly identical to light sleep in HR/HRV features.
+
+## Worst Night Deep Dive (2026-01-31, MAE=14.9, acc=56.7%)
+- Night has higher HR above resting than average (+15%)
+- REM distributed unusually: 53 minutes first half, 33 minutes second half
+- Almost all deep sleep in first half (83 windows vs 5 in second half)
+- Model over-predicts REM massively (47.1% vs true 17.3%)
+- **Root cause**: Elevated HR confuses the model into thinking REM when Whoop says Light
+- This night may have atypical physiology (restless night? illness?)
+
 ## Next Steps
-- [ ] Try gradient-boosted transition matrix (different weights for different times of night)
-- [ ] Augment awake class with synthetic examples
-- [ ] Try ensemble of depth=3 and depth=4 models
-- [ ] Try XGBoost/LightGBM as alternative
-- [ ] More data (currently only 15 nights)
+- [ ] More training data (currently only 15 nights -- #1 priority)
+- [ ] Try XGBoost/LightGBM as alternative classifiers
+- [ ] Sequence model (LSTM/GRU) for temporal patterns
+- [ ] Night-adaptive calibration (use first 30 min to adjust thresholds)
+- [ ] Better awake features: body temperature proxy, breathing regularity
