@@ -92,13 +92,16 @@ def load_from_db(db_path: Path = DB_PATH) -> pd.DataFrame:
     total = cur.fetchone()[0]
     print(f"  DB has {total} records, re-decoding rawHex...")
 
-    cur.execute("SELECT timestamp, heartRate, rr1Ms, rrCount, rawHex FROM sensor_records ORDER BY timestamp")
+    cur.execute("""SELECT timestamp, heartRate, rr1Ms, rrCount,
+                           accelX, accelY, accelZ, gyro, spo2Percent,
+                           rawHex
+                    FROM sensor_records ORDER BY timestamp""")
 
     rows = []
     decoded = 0
     direct = 0
 
-    for db_ts, db_hr, db_rr1, db_rrc, raw_hex in cur:
+    for db_ts, db_hr, db_rr1, db_rrc, db_ax, db_ay, db_az, db_gyro, db_spo2, raw_hex in cur:
         if raw_hex and len(raw_hex) >= 32 and not raw_hex.startswith("hr_ble:"):
             try:
                 raw = bytes.fromhex(raw_hex)
@@ -113,18 +116,31 @@ def load_from_db(db_path: Path = DB_PATH) -> pd.DataFrame:
             except (ValueError, struct.error):
                 pass
 
-        # Fallback: use DB values directly (for hr_ble: records or failed decodes)
+        # Use DB column values directly (including accel/gyro/spo2)
         if db_hr and db_hr > 30:
             direct += 1
             ts = db_ts if db_ts > 1600000000 else int(datetime.now(timezone.utc).timestamp())
+
+            # Validate accel values (reject garbage float overflow)
+            acc_x = float(db_ax) if db_ax and abs(db_ax) < 20 else 0.0
+            acc_y = float(db_ay) if db_ay and abs(db_ay) < 20 else 0.0
+            acc_z = float(db_az) if db_az and abs(db_az) < 20 else 0.0
+            gyro_val = float(db_gyro) if db_gyro and abs(db_gyro) < 50 else 0.0
+            spo2_val = int(db_spo2) if db_spo2 and 50 < db_spo2 < 110 else None
+
+            if all(abs(v) < 20 for v in [acc_x, acc_y, acc_z]):
+                movement = abs(math.sqrt(acc_x**2 + acc_y**2 + acc_z**2) - 1.0)
+            else:
+                movement = 0.0
+
             rows.append({
                 "timestamp": ts,
                 "hr": db_hr,
                 "rr_count": db_rrc or 0,
                 "rr1_ms": db_rr1 if db_rr1 and 200 < db_rr1 < 2500 else np.nan,
                 "rr2_ms": np.nan,
-                "acc_x": 0.0, "acc_y": 0.0, "acc_z": 0.0,
-                "movement": 0.0, "gyro": 0.0, "spo2": None,
+                "acc_x": acc_x, "acc_y": acc_y, "acc_z": acc_z,
+                "movement": movement, "gyro": gyro_val, "spo2": spo2_val,
                 "datetime_utc": datetime.fromtimestamp(ts, timezone.utc),
                 "datetime_local": datetime.fromtimestamp(ts, timezone.utc) + BERLIN,
                 "date": (datetime.fromtimestamp(ts, timezone.utc) + BERLIN).date(),
