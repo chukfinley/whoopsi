@@ -5,6 +5,12 @@ Uses per-second HR + RR interval sensor data aligned with Whoop's minute-by-minu
 sleep stage labels extracted from deep dive JSONs. Trains a HistGradientBoostingClassifier
 with leave-one-night-out cross-validation and Viterbi post-processing.
 
+v5 improvements (Mar 2026):
+- 63 features (was 58): +5 Light/Deep/REM discriminating features
+  hr_std_zone, rmssd_zone, light_score, deep_vs_light, rem_vs_light
+- Added algorithms/whoop_backup/deep_dive/ as label search path
+- Merged Mar 13-16 sensor data (180K new records with accel/gyro/spo2)
+
 v4 improvements (Mar 2026):
 - 58 features (was 48): +3/15-min rolling, acc_energy, acc_zcr, hr_accel,
   hr_skewness, hr_std*gyro_std interaction, rmssd/hr normalized HRV
@@ -95,6 +101,8 @@ FEATURE_NAMES = [
     "hr_accel", "hr_skewness",
     # Cross-features (2)
     "hr_std_x_gyro_std", "rmssd_over_hr",
+    # --- NEW v5 features: Light/Deep/REM discriminators (5) ---
+    "hr_std_zone", "rmssd_zone", "light_score", "deep_vs_light", "rem_vs_light",
 ]
 
 
@@ -275,9 +283,11 @@ def get_sleep_window(df, day):
 def extract_whoop_labels(date_str):
     """Extract Whoop minute-by-minute sleep stage labels from deep dive JSONs."""
     base = Path(__file__).resolve().parent.parent
+    algo_dir = Path(__file__).resolve().parent
     candidates = [
         base / "ble-sync" / "data" / "backup" / "api" / "deep_dive" / date_str / "sleep_lastnight.json",
         base / "ble-sync" / "data" / "whoop_backup" / "deep_dive" / f"{date_str}.json",
+        algo_dir / "whoop_backup" / "deep_dive" / f"{date_str}.json",
     ]
     text = None
     for sln in candidates:
@@ -384,7 +394,7 @@ def _compute_spectral_features(rr_vals):
 
 
 def extract_minute_features(chunk, rhr, hours_since_onset, fraction_of_night):
-    """Extract 58 features for a 1-minute window of sensor data.
+    """Extract 63 features for a 1-minute window of sensor data.
 
     Returns feature vector (numpy array) or None if insufficient data.
     """
@@ -522,6 +532,27 @@ def extract_minute_features(chunk, rhr, hours_since_onset, fraction_of_night):
     hr_std_x_gyro_std = hr_std * gyro_std_val
     rmssd_over_hr = rmssd / hr_mean if hr_mean > 0 else 0.0
 
+    # --- NEW v5 features: Light/Deep/REM discriminators ---
+    # hr_std_zone: 0=deep-like (<4), 1=light-like (4-7), 2=rem-like (>7)
+    hr_std_zone = 0.0 if hr_std < 4.0 else (1.0 if hr_std <= 7.0 else 2.0)
+
+    # rmssd_zone: 0=deep-like (<90), 1=light-like (90-140), 2=rem-like (>140)
+    rmssd_zone = 0.0 if rmssd < 90.0 else (1.0 if rmssd <= 140.0 else 2.0)
+
+    # light_score: composite score for light sleep signature
+    light_score = float(
+        (1.0 if pnn50 > 55 else 0.0)
+        + (1.0 if 3.0 < hr_above_rhr < 6.0 else 0.0)
+        + (1.0 if 4.0 < hr_std < 7.0 else 0.0)
+        + (1.0 if 0.1 < gyro_spikes_val < 1.0 else 0.0)
+    ) / 4.0  # normalize to 0-1
+
+    # deep_vs_light: hr_std / (rmssd + 1) — low for light, high for deep
+    deep_vs_light = hr_std / (rmssd + 1.0)
+
+    # rem_vs_light: gyro_spikes * spo2_std — high for REM, low for light
+    rem_vs_light = gyro_spikes_val * spo2_std_val
+
     return np.array([
         hr_mean, hr_median, hr_std, hr_min, hr_max, hr_p10, hr_p90, hr_iqr,
         hr_above_rhr,
@@ -550,6 +581,8 @@ def extract_minute_features(chunk, rhr, hours_since_onset, fraction_of_night):
         hr_accel, hr_skewness,
         # Cross-features
         hr_std_x_gyro_std, rmssd_over_hr,
+        # NEW v5: Light/Deep/REM discriminators
+        hr_std_zone, rmssd_zone, light_score, deep_vs_light, rem_vs_light,
     ], dtype=np.float64)
 
 
@@ -811,8 +844,8 @@ def compute_mae(pcts_a, pcts_b):
 
 def main():
     print("=" * 70)
-    print("WHOOP SLEEP STAGING MODEL TRAINER v4")
-    print("  58 features | Viterbi | max_depth=3 | sleep onset detection")
+    print("WHOOP SLEEP STAGING MODEL TRAINER v5")
+    print("  63 features | Viterbi | max_depth=3 | Light/Deep/REM discriminators")
     print("=" * 70)
 
     # 1. Load sensor data
