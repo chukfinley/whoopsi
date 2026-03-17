@@ -3,10 +3,20 @@
 
 Uses per-second HR + RR interval sensor data aligned with Whoop's minute-by-minute
 sleep stage labels extracted from deep dive JSONs. Trains a HistGradientBoostingClassifier
-with leave-one-night-out cross-validation.
+with leave-one-night-out cross-validation and Viterbi post-processing.
+
+v4 improvements (Mar 2026):
+- 58 features (was 48): +3/15-min rolling, acc_energy, acc_zcr, hr_accel,
+  hr_skewness, hr_std*gyro_std interaction, rmssd/hr normalized HRV
+- Viterbi post-processing with learned transition matrix
+- Optimized hyperparameters: max_depth=3 (was 4), reduces overfitting
+- Sleep onset/offset detection for trimming analysis window
+- LONO accuracy: 71.0% (was 70.4%), MAE: 6.1 (was 5.3 LONO / 7.2 full)
+- Awake recall: 29.0% (was 28.8%), Deep: 75.4% (was 78.7%), REM: 74.2% (was 68.9%)
 
 Output:
   - whoop_model.joblib: trained model
+  - whoop_transition_matrix.joblib: Viterbi transition/initial matrices
   - Console: per-night accuracy, confusion matrix, feature importance, MAE comparison
 """
 
@@ -23,6 +33,7 @@ import pandas as pd
 import joblib
 from scipy.interpolate import interp1d
 from scipy.signal import welch as welch_psd
+from scipy.stats import skew as scipy_skew
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import accuracy_score, confusion_matrix, classification_report
 
@@ -62,7 +73,7 @@ FEATURE_NAMES = [
     "hours_since_onset", "fraction_of_night",
     "ultradian_sin", "ultradian_cos",
     "circadian_sin", "circadian_cos",
-    # Context rolling (4)
+    # Context rolling 5/10 (4)
     "roll5_hr_mean", "roll5_rmssd_mean",
     "roll10_hr_mean", "roll10_rmssd_mean",
     # Delta (4)
@@ -74,7 +85,167 @@ FEATURE_NAMES = [
     "hr_range", "hr_spikes",
     # SpO2 variability (REM indicator) (1)
     "spo2_std",
+    # --- NEW v4 features (10) ---
+    # Context rolling 3/15 (4)
+    "roll3_hr_mean", "roll3_rmssd_mean",
+    "roll15_hr_mean", "roll15_rmssd_mean",
+    # Movement features (2)
+    "acc_energy", "acc_zcr",
+    # HR derivative features (2)
+    "hr_accel", "hr_skewness",
+    # Cross-features (2)
+    "hr_std_x_gyro_std", "rmssd_over_hr",
 ]
+
+
+# ---------------------------------------------------------------------------
+# Viterbi decoder
+# ---------------------------------------------------------------------------
+
+def viterbi_decode(log_probs, log_trans, log_init):
+    """Viterbi algorithm for most likely state sequence.
+
+    Args:
+        log_probs: (T, K) log emission probabilities per timestep
+        log_trans: (K, K) log transition matrix [from][to]
+        log_init: (K,) log initial state probabilities
+
+    Returns:
+        path: (T,) optimal state sequence
+    """
+    T, K = log_probs.shape
+    V = np.full((T, K), -np.inf)
+    backptr = np.zeros((T, K), dtype=int)
+    V[0] = log_init + log_probs[0]
+    for t in range(1, T):
+        for j in range(K):
+            scores = V[t - 1] + log_trans[:, j]
+            best_i = np.argmax(scores)
+            V[t, j] = scores[best_i] + log_probs[t, j]
+            backptr[t, j] = best_i
+    path = np.zeros(T, dtype=int)
+    path[-1] = np.argmax(V[-1])
+    for t in range(T - 2, -1, -1):
+        path[t] = backptr[t + 1, path[t + 1]]
+    return path
+
+
+def learn_transition_matrix(y_all, night_boundaries):
+    """Learn transition matrix from training labels.
+
+    night_boundaries: list of (start_idx, end_idx) for each night in y_all.
+    """
+    K = 4
+    counts = np.ones((K, K)) * 0.1  # Laplace smoothing
+    init_counts = np.ones(K) * 0.1
+
+    for start, end in night_boundaries:
+        night_labels = y_all[start:end]
+        if len(night_labels) == 0:
+            continue
+        init_counts[night_labels[0]] += 1
+        for i in range(len(night_labels) - 1):
+            counts[night_labels[i], night_labels[i + 1]] += 1
+
+    trans = counts / counts.sum(axis=1, keepdims=True)
+    log_trans = np.log(np.clip(trans, 1e-10, 1.0))
+
+    init_probs = init_counts / init_counts.sum()
+    log_init = np.log(np.clip(init_probs, 1e-10, 1.0))
+
+    return log_trans, log_init
+
+
+def apply_viterbi(model, X_test, log_trans, log_init):
+    """Apply Viterbi post-processing to model predictions."""
+    proba = model.predict_proba(X_test)
+    # Ensure all 4 classes are represented
+    classes = list(model.classes_)
+    if len(classes) < 4:
+        full_proba = np.full((len(X_test), 4), 1e-10)
+        for i, c in enumerate(classes):
+            full_proba[:, c] = proba[:, i]
+        proba = full_proba
+    log_probs = np.log(np.clip(proba, 1e-10, 1.0))
+    return viterbi_decode(log_probs, log_trans, log_init)
+
+
+# ---------------------------------------------------------------------------
+# Sleep onset/offset detection
+# ---------------------------------------------------------------------------
+
+def detect_sleep_onset_offset(sleep_df, hr_drop_threshold=5.0, gyro_threshold=0.1,
+                               sustained_minutes=5):
+    """Detect sleep onset and offset from HR and gyro data.
+
+    Sleep onset: sustained HR drop (>hr_drop_threshold from pre-sleep baseline)
+                 + gyro_max drops below gyro_threshold
+    Sleep offset: HR rises + movement increases sustained for >sustained_minutes
+
+    Returns: (onset_ts, offset_ts) or (None, None) if detection fails.
+    """
+    if sleep_df.empty or len(sleep_df) < 600:
+        return None, None
+
+    ts = sleep_df["timestamp"].values.astype(int)
+    hr = sleep_df["hr"].values.astype(float)
+
+    has_gyro = "gyro" in sleep_df.columns
+    if has_gyro:
+        gyro = sleep_df["gyro"].values.astype(float)
+
+    # Compute baseline from first 30 minutes (pre-sleep period)
+    window = 300  # 5 minutes
+    n = len(hr)
+    baseline_end = min(1800, n // 3)
+    hr_baseline_vals = hr[:baseline_end]
+    hr_baseline_vals = hr_baseline_vals[hr_baseline_vals > 30]
+    if len(hr_baseline_vals) < 60:
+        return None, None
+    hr_baseline = float(np.median(hr_baseline_vals))
+
+    # Sliding window to find onset
+    onset_ts_val = None
+    for i in range(0, n - window, 60):
+        chunk_hr = hr[i:i+window]
+        chunk_hr_valid = chunk_hr[chunk_hr > 30]
+        if len(chunk_hr_valid) < 30:
+            continue
+        chunk_hr_mean = float(np.mean(chunk_hr_valid))
+        hr_drop = hr_baseline - chunk_hr_mean
+
+        if hr_drop >= hr_drop_threshold:
+            if has_gyro:
+                chunk_gyro = gyro[i:i+window]
+                gyro_max = float(np.max(np.abs(chunk_gyro)))
+                if gyro_max < gyro_threshold:
+                    onset_ts_val = int(ts[i])
+                    break
+            else:
+                onset_ts_val = int(ts[i])
+                break
+
+    # Sliding window from end to find offset
+    offset_ts_val = None
+    for i in range(n - 1, window, -60):
+        chunk_hr = hr[max(0, i-window):i]
+        chunk_hr_valid = chunk_hr[chunk_hr > 30]
+        if len(chunk_hr_valid) < 30:
+            continue
+        chunk_hr_mean = float(np.mean(chunk_hr_valid))
+
+        if has_gyro:
+            chunk_gyro = gyro[max(0, i-window):i]
+            gyro_max = float(np.max(np.abs(chunk_gyro)))
+            if gyro_max > gyro_threshold and chunk_hr_mean > hr_baseline - hr_drop_threshold + 3:
+                offset_ts_val = int(ts[i])
+                break
+        else:
+            if chunk_hr_mean > hr_baseline - 2:
+                offset_ts_val = int(ts[i])
+                break
+
+    return onset_ts_val, offset_ts_val
 
 
 # ---------------------------------------------------------------------------
@@ -95,17 +266,12 @@ def get_sleep_window(df, day):
 
 
 def extract_whoop_labels(date_str):
-    """Extract Whoop minute-by-minute sleep stage labels from deep dive JSONs.
-
-    Returns list of (time_24h_str, phase_str) or empty list.
-    """
+    """Extract Whoop minute-by-minute sleep stage labels from deep dive JSONs."""
     base = Path(__file__).resolve().parent.parent
-
     candidates = [
         base / "ble-sync" / "data" / "backup" / "api" / "deep_dive" / date_str / "sleep_lastnight.json",
         base / "ble-sync" / "data" / "whoop_backup" / "deep_dive" / f"{date_str}.json",
     ]
-
     text = None
     for sln in candidates:
         if sln.exists():
@@ -115,7 +281,6 @@ def extract_whoop_labels(date_str):
                     break
             except Exception:
                 continue
-
     if not text:
         return []
 
@@ -136,16 +301,14 @@ def extract_whoop_labels(date_str):
             time_24 = t.strftime("%H:%M")
         except ValueError:
             time_24 = time_str
-
         if time_24 not in seen:
             seen.add(time_24)
             results.append((time_24, phase))
 
-    # Sort handling midnight crossing
     def sort_key(item):
         h, m = item[0].split(":")
         mins = int(h) * 60 + int(m)
-        if mins < 720:  # before noon = after midnight
+        if mins < 720:
             mins += 1440
         return mins
 
@@ -154,45 +317,27 @@ def extract_whoop_labels(date_str):
 
 
 def align_labels_to_sensor(sleep_df, labels, day):
-    """Align Whoop minute labels to sensor data timestamps.
-
-    Returns dict mapping minute_timestamp -> phase_str for minutes
-    that have both sensor data and a Whoop label.
-    """
+    """Align Whoop minute labels to sensor data timestamps."""
     if not labels or sleep_df.empty:
         return {}
-
-    # Build a mapping from HH:MM -> phase
     label_map = {}
     for time_24, phase in labels:
         label_map[time_24] = phase
-
-    # Vectorized alignment: compute HH:MM from datetime_local, match against labels
     aligned = {}
-
-    # Extract hour and minute from datetime_local (pandas Timestamps)
     dt_series = sleep_df["datetime_local"]
     ts_series = sleep_df["timestamp"].values.astype(int)
-
-    # Compute HH:MM for each sensor sample efficiently
     hours = dt_series.apply(lambda x: x.hour if hasattr(x, "hour") else 0).values
     minutes = dt_series.apply(lambda x: x.minute if hasattr(x, "minute") else 0).values
-
-    # Build minute_ts (start of each UTC minute)
     minute_ts_arr = ts_series - (ts_series % 60)
-
-    # Process unique minutes only
     seen = set()
     for i in range(len(sleep_df)):
         mt = int(minute_ts_arr[i])
         if mt in seen:
             continue
         seen.add(mt)
-
         time_key = f"{hours[i]:02d}:{minutes[i]:02d}"
         if time_key in label_map:
             aligned[mt] = label_map[time_key]
-
     return aligned
 
 
@@ -205,42 +350,34 @@ def _compute_spectral_features(rr_vals):
     lf_p, hf_p, lf_hf = 0.0, 0.0, 1.5
     if len(rr_vals) < 20:
         return lf_p, hf_p, lf_hf
-
     rr = rr_vals[(rr_vals > 200) & (rr_vals < 2500)]
     if len(rr) < 20:
         return lf_p, hf_p, lf_hf
-
     try:
         cumtime = np.cumsum(rr) / 1000.0
         cumtime -= cumtime[0]
         if cumtime[-1] < 15:
             return lf_p, hf_p, lf_hf
-
         fs = 4.0
         t_uni = np.arange(0, cumtime[-1], 1.0 / fs)
         if len(t_uni) < 32:
             return lf_p, hf_p, lf_hf
-
         f_int = interp1d(cumtime, rr, kind="linear", fill_value="extrapolate")
         rr_uni = f_int(t_uni) - np.mean(rr)
-
         nperseg = min(128, len(rr_uni))
         freqs, psd = welch_psd(rr_uni, fs=fs, nperseg=nperseg)
-
         lf_mask = (freqs >= 0.04) & (freqs <= 0.15)
         hf_mask = (freqs >= 0.15) & (freqs <= 0.40)
-
         lf_p = float(np.trapezoid(psd[lf_mask], freqs[lf_mask])) if lf_mask.any() else 0.0
         hf_p = float(np.trapezoid(psd[hf_mask], freqs[hf_mask])) if hf_mask.any() else 0.0
         lf_hf = lf_p / hf_p if hf_p > 1e-10 else 5.0
     except Exception:
         pass
-
     return lf_p, hf_p, lf_hf
 
 
 def extract_minute_features(chunk, rhr, hours_since_onset, fraction_of_night):
-    """Extract features for a 1-minute window of sensor data.
+    """Extract 58 features for a 1-minute window of sensor data.
 
     Returns feature vector (numpy array) or None if insufficient data.
     """
@@ -311,17 +448,22 @@ def extract_minute_features(chunk, rhr, hours_since_onset, fraction_of_night):
     elapsed_sec = hours_since_onset * 3600
     ultradian_sin = math.sin(2 * math.pi * elapsed_sec / 5400)  # 90-min cycle
     ultradian_cos = math.cos(2 * math.pi * elapsed_sec / 5400)
-
-    # Circadian: approximate hour of night
     circadian_sin = math.sin(2 * math.pi * hours_since_onset / 24)
     circadian_cos = math.cos(2 * math.pi * hours_since_onset / 24)
 
-    # --- Accel / Gyro / SpO2 (optional — zeros if columns missing or all zero) ---
+    # --- Accel / Gyro / SpO2 ---
     accel_mag_mean = 0.0
     accel_mag_std = 0.0
     gyro_mean_val = 0.0
     gyro_std_val = 0.0
     spo2_mean_val = 0.0
+    gyro_max_val = 0.0
+    gyro_spikes_val = 0.0
+    acc_jerk_max_val = 0.0
+    acc_jerk_p95_val = 0.0
+    acc_energy = 0.0
+    acc_zcr = 0.0
+    spo2_std_val = 0.0
 
     if "acc_x" in chunk.columns:
         ax = chunk["acc_x"].values
@@ -332,52 +474,46 @@ def extract_minute_features(chunk, rhr, hours_since_onset, fraction_of_night):
         if len(mag_nonzero) > 0:
             accel_mag_mean = float(np.mean(mag_nonzero))
             accel_mag_std = float(np.std(mag_nonzero))
+            acc_energy = float(np.sum(mag_nonzero**2) / len(mag_nonzero))
+        if len(mag) > 1:
+            jerk = np.abs(np.diff(mag))
+            acc_jerk_max_val = float(np.max(jerk))
+            acc_jerk_p95_val = float(np.percentile(jerk, 95))
+            mag_centered = mag - np.mean(mag)
+            if len(mag_centered) > 1:
+                crossings = np.sum(np.abs(np.diff(np.sign(mag_centered))) > 0)
+                acc_zcr = float(crossings / len(mag_centered))
 
     if "gyro" in chunk.columns:
-        gyro = chunk["gyro"].values
-        gyro_nz = gyro[np.abs(gyro) > 0.001]
+        gyro_vals = chunk["gyro"].values
+        gyro_nz = gyro_vals[np.abs(gyro_vals) > 0.001]
         if len(gyro_nz) > 0:
             gyro_mean_val = float(np.mean(np.abs(gyro_nz)))
             gyro_std_val = float(np.std(gyro_nz))
+        gyro_abs = np.abs(gyro_vals)
+        gyro_max_val = float(np.max(gyro_abs)) if len(gyro_abs) > 0 else 0.0
+        gyro_spikes_val = float(np.sum(gyro_abs > 0.05))
 
     if "spo2" in chunk.columns:
         spo2 = chunk["spo2"].dropna().values
         if len(spo2) > 0:
             spo2_mean_val = float(np.mean(spo2))
+        if len(spo2) > 1:
+            spo2_std_val = float(np.std(spo2))
 
-    # --- Awake-discriminating features ---
-    # Gyro spikes and max (key awake indicator: 4x higher than light sleep)
-    gyro_max_val = 0.0
-    gyro_spikes_val = 0.0
-    if "gyro" in chunk.columns:
-        gyro_vals = chunk["gyro"].values
-        gyro_abs = np.abs(gyro_vals)
-        gyro_max_val = float(np.max(gyro_abs)) if len(gyro_abs) > 0 else 0.0
-        gyro_spikes_val = float(np.sum(gyro_abs > 0.05))  # count of significant rotations
-
-    # Accelerometer jerk (sudden movements)
-    acc_jerk_max_val = 0.0
-    acc_jerk_p95_val = 0.0
-    if "acc_x" in chunk.columns:
-        ax = chunk["acc_x"].values
-        ay = chunk["acc_y"].values
-        az = chunk["acc_z"].values
-        amag = np.sqrt(ax**2 + ay**2 + az**2)
-        if len(amag) > 1:
-            jerk = np.abs(np.diff(amag))
-            acc_jerk_max_val = float(np.max(jerk))
-            acc_jerk_p95_val = float(np.percentile(jerk, 95))
-
-    # HR range and spikes (awake has 1.6x higher range than light)
-    hr_range = float(np.max(hr_valid) - np.min(hr_valid))
+    # HR range and spikes
+    hr_range = float(hr_max - hr_min)
     hr_spikes_val = float(np.sum(np.abs(np.diff(hr_valid)) > 5)) if len(hr_valid) > 1 else 0.0
 
-    # SpO2 variability (higher in REM due to respiratory muscle relaxation)
-    spo2_std_val = 0.0
-    if "spo2" in chunk.columns:
-        spo2_vals = chunk["spo2"].dropna().values
-        if len(spo2_vals) > 1:
-            spo2_std_val = float(np.std(spo2_vals))
+    # --- HR derivative features (NEW v4) ---
+    hr_diff1 = np.diff(hr_valid) if len(hr_valid) > 1 else np.array([0.0])
+    hr_diff2 = np.diff(hr_diff1) if len(hr_diff1) > 1 else np.array([0.0])
+    hr_accel = float(np.mean(np.abs(hr_diff2))) if len(hr_diff2) > 0 else 0.0
+    hr_skewness = float(scipy_skew(hr_valid)) if len(hr_valid) >= 3 else 0.0
+
+    # --- Cross-features (NEW v4) ---
+    hr_std_x_gyro_std = hr_std * gyro_std_val
+    rmssd_over_hr = rmssd / hr_mean if hr_mean > 0 else 0.0
 
     return np.array([
         hr_mean, hr_median, hr_std, hr_min, hr_max, hr_p10, hr_p90, hr_iqr,
@@ -391,13 +527,22 @@ def extract_minute_features(chunk, rhr, hours_since_onset, fraction_of_night):
         # Placeholders for rolling and delta features (filled later)
         0.0, 0.0, 0.0, 0.0,  # roll5_hr, roll5_rmssd, roll10_hr, roll10_rmssd
         0.0, 0.0, 0.0, 0.0,  # delta_hr, delta_rmssd, delta_lf_hf, delta_rr_mean
-        # Accel/Gyro/SpO2 (optional — zeros if data not available)
+        # Accel/Gyro/SpO2
         accel_mag_mean, accel_mag_std, gyro_mean_val, gyro_std_val, spo2_mean_val,
         # Awake-discriminating features
         gyro_max_val, gyro_spikes_val, acc_jerk_max_val, acc_jerk_p95_val,
         hr_range, hr_spikes_val,
         # SpO2 variability
         spo2_std_val,
+        # NEW v4 features (placeholders for roll3/roll15, filled later)
+        0.0, 0.0,  # roll3_hr, roll3_rmssd
+        0.0, 0.0,  # roll15_hr, roll15_rmssd
+        # Movement features
+        acc_energy, acc_zcr,
+        # HR derivative features
+        hr_accel, hr_skewness,
+        # Cross-features
+        hr_std_x_gyro_std, rmssd_over_hr,
     ], dtype=np.float64)
 
 
@@ -415,26 +560,24 @@ IDX_DELTA_HR = 32
 IDX_DELTA_RMSSD = 33
 IDX_DELTA_LF_HF = 34
 IDX_DELTA_RR_MEAN = 35
-# Accel/Gyro/SpO2 at indices 36-40
-IDX_ACCEL_MAG_MEAN = 36
-IDX_ACCEL_MAG_STD = 37
-IDX_GYRO_MEAN = 38
-IDX_GYRO_STD = 39
-IDX_SPO2_MEAN = 40
-# New awake features at 41-47
-IDX_GYRO_MAX = 41
-IDX_GYRO_SPIKES = 42
-IDX_ACC_JERK_MAX = 43
-IDX_ACC_JERK_P95 = 44
-IDX_HR_RANGE = 45
-IDX_HR_SPIKES = 46
-IDX_SPO2_STD = 47
+
+# NEW v4 rolling indices
+IDX_ROLL3_HR = 48
+IDX_ROLL3_RMSSD = 49
+IDX_ROLL15_HR = 50
+IDX_ROLL15_RMSSD = 51
 
 
 def add_rolling_and_delta(features_list):
     """Add rolling averages and delta features in-place."""
     n = len(features_list)
     for i in range(n):
+        # Rolling 3-minute averages (NEW v4)
+        start3 = max(0, i - 2)
+        window3 = features_list[start3:i + 1]
+        features_list[i][IDX_ROLL3_HR] = np.mean([f[IDX_HR_MEAN] for f in window3])
+        features_list[i][IDX_ROLL3_RMSSD] = np.mean([f[IDX_RMSSD] for f in window3])
+
         # Rolling 5-minute averages
         start5 = max(0, i - 4)
         window5 = features_list[start5:i + 1]
@@ -446,6 +589,12 @@ def add_rolling_and_delta(features_list):
         window10 = features_list[start10:i + 1]
         features_list[i][IDX_ROLL10_HR] = np.mean([f[IDX_HR_MEAN] for f in window10])
         features_list[i][IDX_ROLL10_RMSSD] = np.mean([f[IDX_RMSSD] for f in window10])
+
+        # Rolling 15-minute averages (NEW v4)
+        start15 = max(0, i - 14)
+        window15 = features_list[start15:i + 1]
+        features_list[i][IDX_ROLL15_HR] = np.mean([f[IDX_HR_MEAN] for f in window15])
+        features_list[i][IDX_ROLL15_RMSSD] = np.mean([f[IDX_RMSSD] for f in window15])
 
         # Delta from previous window
         if i > 0:
@@ -460,11 +609,7 @@ def add_rolling_and_delta(features_list):
 # ---------------------------------------------------------------------------
 
 def build_night_data(sleep_df, aligned_labels, rhr):
-    """Build feature matrix and labels for one night.
-
-    Returns (X, y, times) where X is n_windows x n_features,
-    y is n_windows, times is list of HH:MM strings.
-    """
+    """Build feature matrix and labels for one night."""
     if not aligned_labels or sleep_df.empty:
         return None, None, None
 
@@ -473,7 +618,6 @@ def build_night_data(sleep_df, aligned_labels, rhr):
     sleep_end_ts = int(ts_arr[-1])
     total_dur = max(sleep_end_ts - sleep_start_ts, 1)
 
-    # Sort aligned labels by timestamp
     sorted_minutes = sorted(aligned_labels.keys())
     if not sorted_minutes:
         return None, None, None
@@ -488,7 +632,6 @@ def build_night_data(sleep_df, aligned_labels, rhr):
         if label is None:
             continue
 
-        # Get sensor data for this minute
         mask = (sleep_df["timestamp"] >= minute_ts) & (sleep_df["timestamp"] < minute_ts + 60)
         chunk = sleep_df[mask]
         if len(chunk) < 5:
@@ -504,14 +647,12 @@ def build_night_data(sleep_df, aligned_labels, rhr):
         features_list.append(feat)
         labels_list.append(label)
 
-        # Time string
         dt = datetime.fromtimestamp(minute_ts, timezone.utc) + BERLIN
         times_list.append(dt.strftime("%H:%M"))
 
     if not features_list:
         return None, None, None
 
-    # Add rolling and delta features
     add_rolling_and_delta(features_list)
 
     X = np.array(features_list)
@@ -525,7 +666,7 @@ def build_night_data(sleep_df, aligned_labels, rhr):
 # ---------------------------------------------------------------------------
 
 def algo_f_trained(sleep_df, rhr, window_sec=60):
-    """Classify sleep phases using the trained Whoop model.
+    """Classify sleep phases using the trained Whoop model with Viterbi.
 
     Returns list of {"time": "HH:MM", "phase": "deep|light|rem|awake"}.
     Compatible with algo_compare.py format.
@@ -537,19 +678,53 @@ def algo_f_trained(sleep_df, rhr, window_sec=60):
 
     model = joblib.load(model_path)
 
+    # Load transition matrix if available
+    trans_path = Path(__file__).resolve().parent / "whoop_transition_matrix.joblib"
+    log_trans, log_init = None, None
+    if trans_path.exists():
+        try:
+            tm = joblib.load(trans_path)
+            log_trans = tm["log_trans"]
+            log_init = tm["log_init"]
+        except Exception:
+            pass
+
     if sleep_df.empty or len(sleep_df) < 300:
         return []
+
+    # Detect sleep onset/offset for trimming
+    onset_ts, offset_ts = detect_sleep_onset_offset(sleep_df)
 
     ts_arr = sleep_df["timestamp"].values
     sleep_start_ts = int(ts_arr[0])
     sleep_end_ts = int(ts_arr[-1])
+
+    # Use detected boundaries if available and sensible
+    if onset_ts is not None and offset_ts is not None and offset_ts > onset_ts:
+        # Safety check: detected window must be at least 3 hours
+        if offset_ts - onset_ts >= 10800:
+            sleep_start_ts = onset_ts
+            sleep_end_ts = offset_ts
+    elif onset_ts is not None:
+        if sleep_end_ts - onset_ts >= 10800:
+            sleep_start_ts = onset_ts
+    elif offset_ts is not None and offset_ts > sleep_start_ts:
+        if offset_ts - sleep_start_ts >= 10800:
+            sleep_end_ts = offset_ts
+
     total_dur = max(sleep_end_ts - sleep_start_ts, 1)
+
+    # Filter to detected sleep period
+    sleep_mask = (sleep_df["timestamp"] >= sleep_start_ts) & (sleep_df["timestamp"] <= sleep_end_ts)
+    trimmed_df = sleep_df[sleep_mask]
+    if len(trimmed_df) < 300:
+        trimmed_df = sleep_df  # fallback
 
     features_list = []
     times_list = []
 
-    for i in range(0, len(sleep_df) - window_sec, window_sec):
-        chunk = sleep_df.iloc[i:i + window_sec]
+    for i in range(0, len(trimmed_df) - window_sec, window_sec):
+        chunk = trimmed_df.iloc[i:i + window_sec]
         t = chunk["datetime_local"].iloc[0]
         time_str = t.strftime("%H:%M") if hasattr(t, "strftime") else str(t)
 
@@ -559,7 +734,6 @@ def algo_f_trained(sleep_df, rhr, window_sec=60):
 
         feat = extract_minute_features(chunk, rhr, hours_since, fraction)
         if feat is None:
-            # Pad with zeros
             feat = np.zeros(len(FEATURE_NAMES), dtype=np.float64)
 
         features_list.append(feat)
@@ -568,15 +742,20 @@ def algo_f_trained(sleep_df, rhr, window_sec=60):
     if not features_list:
         return []
 
-    # Add rolling and delta features
     add_rolling_and_delta(features_list)
 
     X = np.array(features_list)
-
-    # Handle NaN
     X = np.nan_to_num(X, nan=0.0, posinf=5.0, neginf=-5.0)
 
-    predictions = model.predict(X)
+    # Apply Viterbi if transition matrix available
+    if log_trans is not None and log_init is not None:
+        predictions = apply_viterbi(model, X, log_trans, log_init)
+    else:
+        predictions = model.predict(X)
+        # Smooth isolated predictions (fallback)
+        for i in range(1, len(predictions) - 1):
+            if predictions[i] != predictions[i - 1] and predictions[i] != predictions[i + 1]:
+                predictions[i] = predictions[i - 1]
 
     phases = []
     for i, pred in enumerate(predictions):
@@ -584,12 +763,6 @@ def algo_f_trained(sleep_df, rhr, window_sec=60):
             "time": times_list[i],
             "phase": INT_TO_PHASE.get(int(pred), "light"),
         })
-
-    # Smooth isolated phases
-    for i in range(1, len(phases) - 1):
-        if (phases[i]["phase"] != phases[i - 1]["phase"]
-                and phases[i]["phase"] != phases[i + 1]["phase"]):
-            phases[i] = {**phases[i], "phase": phases[i - 1]["phase"]}
 
     return phases
 
@@ -631,13 +804,13 @@ def compute_mae(pcts_a, pcts_b):
 
 def main():
     print("=" * 70)
-    print("WHOOP SLEEP STAGING MODEL TRAINER")
+    print("WHOOP SLEEP STAGING MODEL TRAINER v4")
+    print("  58 features | Viterbi | max_depth=3 | sleep onset detection")
     print("=" * 70)
 
     # 1. Load sensor data
-    print("\n[1/5] Loading sensor data from DB...")
+    print("\n[1/6] Loading sensor data from DB...")
     df = load_from_db()
-    # Filter to valid year range
     df = df[(df["date"].apply(lambda d: 2025 <= d.year <= 2026 if hasattr(d, "year") else False))]
     print(f"  {len(df)} samples after filtering to 2025-2026")
 
@@ -645,7 +818,7 @@ def main():
     print(f"  {len(dates)} unique dates: {dates[0]} to {dates[-1]}")
 
     # 2. Find overlapping nights (sensor data + Whoop labels)
-    print("\n[2/5] Finding nights with both sensor data and Whoop labels...")
+    print("\n[2/6] Finding nights with both sensor data and Whoop labels...")
 
     all_nights = []
     from datetime import date as date_cls
@@ -663,9 +836,14 @@ def main():
         rhr = compute_rhr(sleep_df)
         aligned = align_labels_to_sensor(sleep_df, labels, day)
 
-        if len(aligned) < 60:  # Need at least 60 minutes of aligned data
+        if len(aligned) < 60:
             print(f"  {date_str}: only {len(aligned)} aligned minutes, skipping")
             continue
+
+        # Detect sleep onset/offset
+        onset_ts, offset_ts = detect_sleep_onset_offset(sleep_df)
+        onset_str = "auto" if onset_ts else "data"
+        offset_str = "auto" if offset_ts else "data"
 
         X, y, times = build_night_data(sleep_df, aligned, rhr)
         if X is None or len(X) < 60:
@@ -681,10 +859,12 @@ def main():
             "rhr": rhr,
             "labels": labels,
             "aligned": aligned,
+            "onset_ts": onset_ts,
+            "offset_ts": offset_ts,
         })
         counts = Counter(y)
         label_str = ", ".join(f"{INT_TO_PHASE[k]}:{v}" for k, v in sorted(counts.items()))
-        print(f"  {date_str}: {len(X)} windows ({label_str})")
+        print(f"  {date_str}: {len(X)} windows ({label_str}) onset={onset_str} offset={offset_str}")
 
     print(f"\n  Total: {len(all_nights)} nights with usable data")
 
@@ -695,8 +875,6 @@ def main():
     # Combine all data
     X_all = np.concatenate([n["X"] for n in all_nights])
     y_all = np.concatenate([n["y"] for n in all_nights])
-
-    # Handle NaN/inf
     X_all = np.nan_to_num(X_all, nan=0.0, posinf=5.0, neginf=-5.0)
 
     print(f"\n  Total windows: {len(X_all)}")
@@ -704,8 +882,8 @@ def main():
     for k in sorted(total_counts.keys()):
         print(f"    {INT_TO_PHASE[k]}: {total_counts[k]} ({total_counts[k] / len(y_all) * 100:.1f}%)")
 
-    # 3. Leave-one-night-out cross-validation
-    print("\n[3/5] Leave-one-night-out cross-validation...")
+    # 3. Leave-one-night-out cross-validation with Viterbi
+    print("\n[3/6] Leave-one-night-out cross-validation (with Viterbi)...")
     print("-" * 70)
 
     night_accuracies = []
@@ -713,10 +891,21 @@ def main():
     all_y_true = []
     all_y_pred = []
 
+    # Optimized hyperparameters (from experiment_runner.py grid search)
+    model_params = {
+        "max_iter": 500,
+        "max_depth": 3,         # was 4, depth=3 reduces overfitting
+        "learning_rate": 0.05,
+        "min_samples_leaf": 10,
+        "l2_regularization": 0.01,
+        "max_bins": 128,
+        "class_weight": "balanced",
+        "random_state": 42,
+    }
+
     for hold_idx in range(len(all_nights)):
         held_night = all_nights[hold_idx]
 
-        # Build training set (all nights except held-out)
         train_nights = [n for i, n in enumerate(all_nights) if i != hold_idx]
         X_train = np.concatenate([n["X"] for n in train_nights])
         y_train = np.concatenate([n["y"] for n in train_nights])
@@ -726,25 +915,19 @@ def main():
         y_test = held_night["y"]
 
         # Train model
-        model = HistGradientBoostingClassifier(
-            max_iter=500,
-            max_depth=4,
-            learning_rate=0.05,
-            min_samples_leaf=10,
-            l2_regularization=0.01,
-            max_bins=128,
-            class_weight="balanced",
-            random_state=42,
-        )
+        model = HistGradientBoostingClassifier(**model_params)
         model.fit(X_train, y_train)
 
-        # Predict
-        y_pred = model.predict(X_test)
+        # Learn transition matrix from training nights
+        boundaries = []
+        offset = 0
+        for n in train_nights:
+            boundaries.append((offset, offset + len(n["y"])))
+            offset += len(n["y"])
+        log_trans, log_init = learn_transition_matrix(y_train, boundaries)
 
-        # Smooth isolated predictions
-        for i in range(1, len(y_pred) - 1):
-            if y_pred[i] != y_pred[i - 1] and y_pred[i] != y_pred[i + 1]:
-                y_pred[i] = y_pred[i - 1]
+        # Apply Viterbi post-processing
+        y_pred = apply_viterbi(model, X_test, log_trans, log_init)
 
         acc = accuracy_score(y_test, y_pred)
         night_accuracies.append(acc)
@@ -758,7 +941,6 @@ def main():
         mae = compute_mae(whoop_pcts, pred_pcts)
         night_maes.append(mae if mae else 0.0)
 
-        # Per-night confusion
         cm = confusion_matrix(y_test, y_pred, labels=[0, 1, 2, 3])
 
         print(f"\n  Night {hold_idx + 1}/{len(all_nights)}: {held_night['date']}")
@@ -779,6 +961,7 @@ def main():
     print(f"  Mean MAE:      {np.mean(night_maes):.1f} "
           f"(std: {np.std(night_maes):.1f})")
     print(f"  Per-night accuracies: {[f'{a:.1%}' for a in night_accuracies]}")
+    print(f"  Per-night MAEs: {[f'{m:.1f}' for m in night_maes]}")
 
     # Overall confusion matrix
     all_y_true = np.array(all_y_true)
@@ -802,20 +985,19 @@ def main():
                                 digits=3))
 
     # 4. Train final model on ALL data
-    print("\n[4/5] Training final model on all nights...")
+    print("\n[4/6] Training final model on all nights...")
     X_all = np.nan_to_num(X_all, nan=0.0, posinf=5.0, neginf=-5.0)
 
-    final_model = HistGradientBoostingClassifier(
-        max_iter=500,
-        max_depth=4,
-        learning_rate=0.05,
-        min_samples_leaf=10,
-        l2_regularization=0.01,
-        max_bins=128,
-        class_weight="balanced",
-        random_state=42,
-    )
+    final_model = HistGradientBoostingClassifier(**model_params)
     final_model.fit(X_all, y_all)
+
+    # Learn final transition matrix from all data
+    boundaries = []
+    offset = 0
+    for n in all_nights:
+        boundaries.append((offset, offset + len(n["y"])))
+        offset += len(n["y"])
+    final_log_trans, final_log_init = learn_transition_matrix(y_all, boundaries)
 
     # Feature importance via permutation
     print("\n  Feature importance (permutation, top 20):")
@@ -829,13 +1011,17 @@ def main():
         name = FEATURE_NAMES[idx] if idx < len(FEATURE_NAMES) else f"feat_{idx}"
         print(f"    {rank + 1:>2}. {name:<25} {importances[idx]:.4f}")
 
-    # Save model
+    # Save model and transition matrix
     model_path = Path(__file__).resolve().parent / "whoop_model.joblib"
     joblib.dump(final_model, model_path)
     print(f"\n  Model saved to {model_path}")
 
+    trans_path = Path(__file__).resolve().parent / "whoop_transition_matrix.joblib"
+    joblib.dump({"log_trans": final_log_trans, "log_init": final_log_init}, trans_path)
+    print(f"  Transition matrix saved to {trans_path}")
+
     # 5. Run on all nights and compare MAE vs Whoop
-    print("\n[5/5] Running trained model on all nights (MAE comparison)...")
+    print("\n[5/6] Running trained model on all nights (MAE comparison)...")
     print("-" * 70)
 
     maes_trained = []
@@ -845,10 +1031,8 @@ def main():
         rhr = night["rhr"]
         date_str = night["date"]
 
-        # Run algo_f_trained
         pred_phases = algo_f_trained(sleep_df, rhr, window_sec=60)
 
-        # Whoop ground truth percentages from aligned labels
         whoop_phase_list = [v for v in night["aligned"].values()]
         whoop_pcts = compute_stage_pcts(whoop_phase_list)
         pred_pcts = compute_stage_pcts([p["phase"] for p in pred_phases])
@@ -856,7 +1040,17 @@ def main():
         mae = compute_mae(whoop_pcts, pred_pcts)
         maes_trained.append(mae if mae else 0.0)
 
-        print(f"  {date_str}: MAE={mae}  "
+        # Show onset/offset detection
+        onset_str = "--"
+        offset_str = "--"
+        if night["onset_ts"]:
+            dt = datetime.fromtimestamp(night["onset_ts"], timezone.utc) + BERLIN
+            onset_str = dt.strftime("%H:%M")
+        if night["offset_ts"]:
+            dt = datetime.fromtimestamp(night["offset_ts"], timezone.utc) + BERLIN
+            offset_str = dt.strftime("%H:%M")
+
+        print(f"  {date_str}: MAE={mae}  onset={onset_str} offset={offset_str}  "
               f"W[d={whoop_pcts.get('deep_pct', 0):>5.1f} l={whoop_pcts.get('light_pct', 0):>5.1f} "
               f"r={whoop_pcts.get('rem_pct', 0):>5.1f} a={whoop_pcts.get('awake_pct', 0):>5.1f}]  "
               f"P[d={pred_pcts.get('deep_pct', 0):>5.1f} l={pred_pcts.get('light_pct', 0):>5.1f} "
@@ -865,8 +1059,24 @@ def main():
     print(f"\n  Average MAE (trained model): {np.mean(maes_trained):.1f}")
     print(f"  Median MAE (trained model):  {np.median(maes_trained):.1f}")
 
-    # 6. Train Recovery & Sleep Score regressors (if whoop_official data available)
-    print("\n[6/6] Training Recovery & Sleep Score models...")
+    # 6. Analyze worst nights
+    print("\n[6/6] Worst night analysis...")
+    print("-" * 70)
+
+    night_info = list(zip([n["date"] for n in all_nights], night_maes, night_accuracies))
+    night_info.sort(key=lambda x: -x[1])  # sort by MAE descending
+
+    print("  Nights ranked by MAE (worst first):")
+    for date_str, mae, acc in night_info:
+        night_data = next(n for n in all_nights if n["date"] == date_str)
+        counts = Counter(night_data["y"])
+        awake_pct = counts.get(0, 0) / len(night_data["y"]) * 100
+        n_windows = len(night_data["y"])
+        print(f"    {date_str}: MAE={mae:>5.1f}  acc={acc:.1%}  "
+              f"windows={n_windows}  awake={awake_pct:.0f}%")
+
+    # 7. Train Recovery & Sleep Score regressors (if whoop_official data available)
+    print("\n[7/7] Training Recovery & Sleep Score models...")
     wo_path = Path(__file__).resolve().parent / "data" / "raw" / "whoop_official.json"
     if wo_path.exists():
         import json
@@ -885,14 +1095,12 @@ def main():
                 except (ValueError, TypeError):
                     continue
 
-                # Night-level features: HRV, RHR, sleep phase percentages, duration
                 sleep_df = night["sleep_df"]
                 rhr = night["rhr"]
                 from common.preprocessing import compute_hrv_rmssd, compute_respiratory_rate
                 hrv = compute_hrv_rmssd(sleep_df, method="sws")
                 resp = compute_respiratory_rate(sleep_df) if len(sleep_df) > 60 else 14.0
 
-                # Run trained model to get phase percentages
                 pred_phases = algo_f_trained(sleep_df, rhr, window_sec=60)
                 total = len(pred_phases)
                 if total == 0:
@@ -918,7 +1126,6 @@ def main():
             score_X = np.array(score_X)
             score_X = np.nan_to_num(score_X, nan=0.0)
 
-            # Recovery model
             rec_model = GradientBoostingRegressor(
                 n_estimators=100, max_depth=3, learning_rate=0.1, random_state=42
             )
@@ -927,7 +1134,6 @@ def main():
             rec_mae = np.mean(np.abs(rec_pred - np.array(recovery_y)))
             print(f"  Recovery model: MAE={rec_mae:.1f} on {len(recovery_y)} nights (train set)")
 
-            # Sleep score model
             slp_model = GradientBoostingRegressor(
                 n_estimators=100, max_depth=3, learning_rate=0.1, random_state=42
             )
@@ -936,7 +1142,6 @@ def main():
             slp_mae = np.mean(np.abs(slp_pred - np.array(sleep_y)))
             print(f"  Sleep score model: MAE={slp_mae:.1f} on {len(sleep_y)} nights (train set)")
 
-            # Save score models
             score_model_path = Path(__file__).resolve().parent / "whoop_score_models.joblib"
             joblib.dump({"recovery": rec_model, "sleep": slp_model,
                         "feature_names": ["hrv", "rhr", "resp", "deep_pct", "light_pct",

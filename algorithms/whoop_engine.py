@@ -45,6 +45,9 @@ from train_whoop_model import (
     extract_whoop_labels,
     align_labels_to_sensor,
     build_night_data,
+    detect_sleep_onset_offset,
+    viterbi_decode,
+    apply_viterbi,
 )
 from common.preprocessing import (
     compute_rhr,
@@ -130,8 +133,10 @@ class WhoopEngine:
     def __init__(self, model_dir: str = "."):
         model_path = Path(model_dir).resolve()
 
-        # Sleep staging model (HistGBT, 41 features, 4 classes)
+        # Sleep staging model (HistGBT, 58 features, 4 classes)
         self.sleep_model = None
+        self.log_trans = None
+        self.log_init = None
         staging_file = model_path / "whoop_model.joblib"
         if staging_file.exists():
             try:
@@ -145,6 +150,17 @@ class WhoopEngine:
                     print(f"[WhoopEngine] Loaded sleep staging model ({n} features)")
             except Exception as e:
                 print(f"[WhoopEngine] Failed to load sleep model: {e}")
+
+        # Viterbi transition matrix for temporal coherence
+        trans_file = model_path / "whoop_transition_matrix.joblib"
+        if trans_file.exists():
+            try:
+                tm = joblib.load(trans_file)
+                self.log_trans = tm["log_trans"]
+                self.log_init = tm["log_init"]
+                print(f"[WhoopEngine] Loaded Viterbi transition matrix")
+            except Exception as e:
+                print(f"[WhoopEngine] Failed to load transition matrix: {e}")
 
         # Recovery + sleep score regressors
         self.recovery_model = None
@@ -262,18 +278,40 @@ class WhoopEngine:
         )
 
     def _stage_ml(self, sleep_df: pd.DataFrame, rhr: float) -> list[dict]:
-        """Stage sleep using the trained ML model (from train_whoop_model)."""
+        """Stage sleep using the trained ML model with Viterbi post-processing."""
+        # Detect sleep onset/offset for trimming
+        onset_ts, offset_ts = detect_sleep_onset_offset(sleep_df)
+
         ts_arr = sleep_df["timestamp"].values
         sleep_start_ts = int(ts_arr[0])
         sleep_end_ts = int(ts_arr[-1])
+
+        # Use detected boundaries if available and sensible (>= 3 hours)
+        if onset_ts is not None and offset_ts is not None and offset_ts > onset_ts:
+            if offset_ts - onset_ts >= 10800:
+                sleep_start_ts = onset_ts
+                sleep_end_ts = offset_ts
+        elif onset_ts is not None:
+            if sleep_end_ts - onset_ts >= 10800:
+                sleep_start_ts = onset_ts
+        elif offset_ts is not None and offset_ts > sleep_start_ts:
+            if offset_ts - sleep_start_ts >= 10800:
+                sleep_end_ts = offset_ts
+
         total_dur = max(sleep_end_ts - sleep_start_ts, 1)
+
+        # Filter to detected sleep period
+        sleep_mask = (sleep_df["timestamp"] >= sleep_start_ts) & (sleep_df["timestamp"] <= sleep_end_ts)
+        trimmed_df = sleep_df[sleep_mask]
+        if len(trimmed_df) < 300:
+            trimmed_df = sleep_df  # fallback
 
         window_sec = 60
         features_list = []
         times_list = []
 
-        for i in range(0, len(sleep_df) - window_sec, window_sec):
-            chunk = sleep_df.iloc[i:i + window_sec]
+        for i in range(0, len(trimmed_df) - window_sec, window_sec):
+            chunk = trimmed_df.iloc[i:i + window_sec]
             t = chunk["datetime_local"].iloc[0]
             time_str = t.strftime("%H:%M") if hasattr(t, "strftime") else str(t)
 
@@ -295,12 +333,15 @@ class WhoopEngine:
         X = np.array(features_list)
         X = np.nan_to_num(X, nan=0.0, posinf=5.0, neginf=-5.0)
 
-        predictions = self.sleep_model.predict(X)
-
-        # Smooth isolated predictions
-        for i in range(1, len(predictions) - 1):
-            if predictions[i] != predictions[i - 1] and predictions[i] != predictions[i + 1]:
-                predictions[i] = predictions[i - 1]
+        # Apply Viterbi if transition matrix available
+        if self.log_trans is not None and self.log_init is not None:
+            predictions = apply_viterbi(self.sleep_model, X, self.log_trans, self.log_init)
+        else:
+            predictions = self.sleep_model.predict(X)
+            # Smooth isolated predictions (fallback)
+            for i in range(1, len(predictions) - 1):
+                if predictions[i] != predictions[i - 1] and predictions[i] != predictions[i + 1]:
+                    predictions[i] = predictions[i - 1]
 
         return [
             {"time": times_list[i], "phase": INT_TO_PHASE.get(int(predictions[i]), "light")}
