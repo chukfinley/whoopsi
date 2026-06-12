@@ -1,6 +1,6 @@
 # Whoop Reverse Engineering Project
 
-**Status: ACTIVE** — Full Sync fixed and running. Official Whoop app has full BT access.
+**Status: ACTIVE** — HTTPS traffic capture running on rooted phone. Official Whoop app syncs BLE → cloud, we capture the upload and decode raw sensor data.
 
 Open-source tools for extracting and analyzing raw sensor data from Whoop 4.0/5.0 fitness bands.
 Legal basis: EU Directive 2009/24/EC Article 6 + German UrhG §69e (reverse engineering for interoperability).
@@ -65,7 +65,13 @@ whoop/
     custom_firmware/       # Proof-of-concept ARM binary
     firmware_downloader.py # Download FW from Whoop API
 
-  tools/                   # BLE packet analysis (parse_hci, decode_packets)
+  tools/                   # BLE packet analysis + traffic capture tools
+    whoop_capture.js       # Frida script: hooks SSL_read/SSL_write in Whoop app
+    decode_h2_traffic.py   # Decode HTTP/2 binary traffic to readable output
+    import_traffic_to_db.py # Import captured traffic → unified sensor DB
+    find_interceptor.py    # APK analysis helper (androguard)
+    parse_hci.py           # Parse Android btsnoop_hci.log
+    decode_packets.py      # Decode AA01 packets, verify CRCs
 ```
 
 ---
@@ -74,50 +80,64 @@ whoop/
 
 | Component | Status | Notes |
 |-----------|--------|-------|
-| **ble-sync** (Kotlin BLE) | ACTIVE | Full Sync working, large data volumes confirmed |
+| **VPS Traffic Capture** (mitmproxy via WireGuard) | ACTIVE | Phone routes all traffic through VPS, sensor DB grows automatically |
+| **Frida on-device capture** | DEPRECATED | Replaced by VPS pipeline — no more adb pull |
+| **ble-sync** (Kotlin BLE) | PAUSED | Works but replaced by traffic capture approach |
 | **cli** (Python) | DONE | login, status, export, deep-dive, dashboard |
-| **algo4_calibrated** (daily scores) | DONE | MAE 2.76 (Recovery/Sleep/Strain) |
-| **algo5_ml** (sleep phases) | ON HOLD | 74.7% LONO accuracy, see agents.md for details |
+| **algo4_calibrated** (daily scores) | ACTIVE | Combined MAE **8.05** on 78 days (2026-05-20). Score history in `algorithms/CLAUDE.md` |
+| **algo5_ml** (sleep phases) | ACTIVE | **75.6%** LONO on 60 nights (2026-05-17). See `algorithms/CLAUDE.md` |
 | **app** (Flutter) | ON HOLD | 15+ screens, needs Kotlin BLE integration |
 | **Firmware RE** | DONE | 6 tracks, HTML report, tools, custom FW skeleton |
 | **Publication prep** | DONE | Personal data sanitized, .gitignore hardened |
 
 ### What Works Right Now
-1. Install companion app → Full Sync downloads entire circular buffer (~20 days)
-2. Official Whoop app runs normally alongside (BT permissions restored)
-3. Pull DB → run `analyze_all.py` → HTML dashboard with scores
-4. `whoop deep-dive --date all` → downloads ground truth from cloud
-5. `eval_lono.py` → evaluates sleep phase accuracy (76.2% 4-fold, 74.7% LONO)
+1. **Official Whoop app** on rooted Galaxy A70 syncs BLE data normally
+2. **VPS mitmproxy** (over WireGuard) decrypts + writes every sensor packet into `/opt/whoop-capture/data/whoop_sensor.db` automatically — no manual capture step
+3. **`scp` + `import_traffic_to_db.py`** → merge VPS DB into unified DB (dedupes on timestamp)
+4. **`whoop deep-dive --date all`** → downloads Whoop's ground-truth labels via Cognito-auth (auto-refresh built into CLI)
+5. **`eval_lono.py`** → evaluates sleep phase accuracy (75.6% LONO baseline)
 
 ---
 
-## Quick Start
+## Quick Start — Pull Data & Update DB
 
-### 1. Build & Install Companion App
+**Data flow:** Phone (rooted) → mitmproxy on VPS (via WireGuard) → VPS sensor DB → pull → unified DB → train.
+The old `adb pull` from phone is **obsolete** — all traffic now routes through the VPS automatically.
+
+### 1. Pull sensor data from VPS (mitmproxy capture server)
 ```bash
-cd ble-sync
-./gradlew assembleDebug
-adb install -r app/build/outputs/apk/debug/app-debug.apk
+# Download sensor DB from VPS
+scp dps:/opt/whoop-capture/data/whoop_sensor.db /tmp/vps_sensor.db
+
+# Import into unified DB (deduplicates via INSERT OR IGNORE on timestamp)
+python3 tools/import_traffic_to_db.py \
+  --old-db /tmp/vps_sensor.db \
+  --output algorithms/data/raw/whoop_unified.db
+
+# Coverage check — expect ~42K records/day
+sqlite3 algorithms/data/raw/whoop_unified.db "
+  SELECT date(timestamp, 'unixepoch', '+1 hour') as day, COUNT(*) as cnt
+  FROM sensor_records
+  WHERE timestamp BETWEEN strftime('%s','now','-14 days') AND strftime('%s','now','+1 day')
+  GROUP BY day ORDER BY day;"
 ```
 
-### 2. Sync Data from Strap
-- **Smart Sync** ("Sync Now"): Starts from current trim, stops after 15 all-duplicate bursts
-- **Full Sync** (orange button): Disconnects/reconnects to reset trim, re-downloads entire buffer (~8-10h for 20 days)
-- Auto-syncs every 6h via WorkManager
-- **Note**: Official Whoop app can run alongside with full BT permissions
-
-### 3. Pull Sensor Database
+### 2. Pull deep-dive ground truth labels (Whoop cloud)
 ```bash
-adb shell "run-as com.whoopcapture cat databases/whoop_capture.db" > whoop_capture.db
-cp whoop_capture.db algorithms/data/raw/
+# Refresh token + pull labels for new dates
+whoop deep-dive --date 2026-04-01           # one date
+whoop deep-dive --date all                  # everything
+
+# CLI auto-refreshes Cognito tokens (auth.py reads client_id from JWT).
+# Override ClientId only if Whoop rotates it:
+#   export WHOOP_COGNITO_CLIENT_ID=<id-from-captured-auth-traffic>
 ```
 
-### 4. Install & Use CLI
+### 3. Install CLI (first time)
 ```bash
 pip install -e ./cli
 whoop login --email you@email.com
-whoop deep-dive --date all
-whoop export --output ble-sync/data/whoop_backup
+whoop export --output whoop_backup
 ```
 
 ### 5. Run Analysis

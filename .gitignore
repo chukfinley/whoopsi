@@ -136,3 +136,13 @@ algorithms/*.joblib
 # PRIVATE REFERENCE DATA (sanitized from public files, kept for internal use)
 # =============================================================================
 PRIVATE_DATA.md
+
+# --- algo12_seq: never publish personal-data artifacts ---
+*.npz
+*.npy
+*.joblib
+algorithms/**/*.html
+algorithms/algo12_seq/daily_scores.json
+algorithms/algo12_seq/preds/
+algorithms/**/__pycache__/
+algorithms/algo5_boost_tune.json
